@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -424,6 +424,10 @@ def _visible(e):
     return True
 
 
+_FROM_IDS = {}
+TALLY_AGENT_ID = "fb90b446-93f7-421a-b85a-f613963d1b47"
+
+
 def read_transcript(path):
     """-> [(seq, id, role, body, title)] ordered by seq; 1:1 mirror of the visible chat.
     roles: user (haohao typed), agent_in (fromAgent), agent_out (assistant message with toAgent), assistant (SendToUser text)."""
@@ -435,7 +439,9 @@ def read_transcript(path):
         if k == "message" and e.get("role") == "user":
             if not _visible(e): continue
             if e.get("fromAgent"):
-                out.append((seq, eid, "agent_in", e.get("content") or "", _agent_name(e["fromAgent"]) or "Agent"))
+                fa = e["fromAgent"]
+                if isinstance(fa, dict): _FROM_IDS[eid] = str(fa.get("id") or fa.get("agentId") or fa.get("agent_id") or "")
+                out.append((seq, eid, "agent_in", e.get("content") or "", _agent_name(fa) or "Agent"))
             elif _is_human_user(e): out.append((seq, eid, "user", e.get("content") or "", "haohao"))
         elif k == "message" and e.get("role") == "assistant" and e.get("toAgent"):
             n = _agent_name(e["toAgent"])
@@ -515,8 +521,9 @@ class ChatSync:
         with self.gmu:
             p = self._group_path(bid)
             if v:
-                self._save(p, {"chat_id": v["chat_id"], "message_id": v["message_id"], "ts": time.time()})
-                self.log(bid, f"群上下文已记录 {v['message_id']}")
+                self._save(p, {"chat_id": v["chat_id"], "message_id": v.get("message_id") or "", "ts": time.time(),
+                               "prefix": v.get("prefix") or ""})
+                self.log(bid, f"群上下文已记录 {v.get('message_id') or v['chat_id']}")
             elif os.path.exists(p):
                 os.remove(p); self.log(bid, "群上下文已清除")
 
@@ -573,7 +580,18 @@ class ChatSync:
                 # haohao Grok→飞书 user cards always stay on sync_chat_id (p2p).
                 if role == "user" and not body.strip().startswith("飞书"):
                     self.set_group(bid, None)
-                g = self.get_group(bid) if role in ("assistant", "widget", "agent_in") else None
+                dispatched = False
+                if role == "agent_in" and b.get("agent_id") != TALLY_AGENT_ID and (
+                        _FROM_IDS.get(eid) == TALLY_AGENT_ID or (not _FROM_IDS.get(eid) and title.strip().lower() == "tally")):
+                    tb = next((x for x in self.store.bots().values() if x.get("agent_id") == TALLY_AGENT_ID), None)
+                    tg = self.get_group(tb["id"]) if tb else None
+                    if tg and tg.get("chat_id"):
+                        nm = b.get("name") or bid
+                        self.set_group(bid, {"chat_id": tg["chat_id"], "prefix": nm})
+                        aok, amsg = send_text(b, tg["chat_id"], f"{nm} {ACK_TEXT}", client[1])
+                        self.log(bid, f"Tally 派单，已在群里确认" if aok else f"群确认失败 {amsg}", "info" if aok else "warn")
+                        dispatched = True
+                g = self.get_group(bid) if role in ("assistant", "widget", "agent_in") and not dispatched else None
                 use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
                 if role == "user":
                     dest = b["sync_chat_id"]
@@ -591,6 +609,10 @@ class ChatSync:
                                         json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False))
                 elif role == "agent_in":
                     ok, msg = _st(b, dest, "", client[1], "interactive", _card(title, "purple", t[:9000]))
+                elif use_group and g.get("prefix") and role == "assistant":
+                    ok, msg = _st(b, dest, "", client[1], "interactive", _md_card_t(g["prefix"], t[:9000]))
+                    if ok:
+                        g["prefix"] = ""; self.set_group(bid, g)
                 elif title:
                     ok, msg = _st(b, dest, "", client[1], "interactive", _md_card_t(title, t[:9000]))
                 else:
