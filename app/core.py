@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.14"
+VERSION = "0.2.15"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -740,12 +740,13 @@ class ChatSync:
 
     @staticmethod
     def _task_card_json(rec):
-        tpl = {"已派": "blue", "处理中": "wathet", "卡住": "red", "完成": "green"}.get(rec["status"], "blue")
-        md = (f"**任务**：{rec.get('task') or '…'}\n**派给**：{rec['bot']}\n**状态**：{rec['status']}\n"
-              f"**时间**：{time.strftime('%m-%d %H:%M', time.gmtime(rec['ts'] + 8 * 3600))} BJT")
-        if rec.get("result"): md += f"\n**{'结果位置' if rec['status'] == '完成' else '说明'}**：{rec['result']}"
+        task = " ".join((rec.get("task") or "…").split())
+        if len(task) > 60: task = task[:60] + "…"
+        tag = {"处理中": "处理中", "完成": "✅完成", "卡住": "⚠️卡住"}.get(rec["status"], "")
+        md = f"@{rec['bot']} {task}" + (f"  · {tag}" if tag else "")
+        if rec["status"] == "完成" and rec.get("result"):
+            r = " ".join(rec["result"].split()); md += "\n结果：" + (r[:80] + "…" if len(r) > 80 else r)
         return json.dumps({"config": {"wide_screen_mode": True, "update_multi": True},
-            "header": {"title": {"tag": "plain_text", "content": f"Tally → {rec['bot']}：{rec['status']}"}, "template": tpl},
             "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
 
     def _task(self, chat_id, bot_name, status, task="", result="", only_existing=False):
