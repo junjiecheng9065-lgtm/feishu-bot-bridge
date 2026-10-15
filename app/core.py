@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.19"
+VERSION = "0.2.20"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -454,11 +454,64 @@ _FROM_IDS = {}
 TALLY_AGENT_ID = "fb90b446-93f7-421a-b85a-f613963d1b47"
 
 
+_IMAGES = {}  # transcript path -> {eid: (seq, [image urls])} from send-message entries
+
+
+def _image_urls(m):
+    urls = []
+    for key in ("images", "attachments"):
+        for a in m.get(key) or []:
+            u = a.get("url") or a.get("uri") or a.get("path") if isinstance(a, dict) else a
+            if not isinstance(u, str): continue
+            mt = (a.get("mimeType") or a.get("mime_type") or a.get("type") or "") if isinstance(a, dict) else ""
+            if key == "images" or "image" in str(mt) or re.search(r"\.(png|jpe?g|gif|webp|bmp)(\?|$)", u, re.I): urls.append(u)
+    if m.get("type") in ("image", "attachment") and isinstance(m.get("url"), str): urls.append(m["url"])
+    return urls
+
+
+def resolve_image(url):
+    """-> (bytes|None, how). https download, data: URI, local file, or basename lookup in local caches."""
+    import base64, urllib.parse
+    try:
+        if url.startswith(("http://", "https://")):
+            with urllib.request.urlopen(url, timeout=30) as r: return r.read(), "https"
+        if url.startswith("data:"):
+            return base64.b64decode(url.split(",", 1)[1]), "data-uri"
+        path = urllib.parse.unquote(urllib.parse.urlparse(url).path if url.startswith("file:") else url)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:", path): path = path[1:]
+        if os.path.isfile(path):
+            with open(path, "rb") as f: return f.read(), "local"
+        name = os.path.basename(path)
+        cands = [os.path.join(data_dir(), "images", name)]
+        gb = os.path.join(os.environ.get("APPDATA", ""), "Grok Bot")
+        if os.path.isdir(gb):
+            for root, _d, files in os.walk(gb):
+                if name in files: cands.append(os.path.join(root, name))
+        for c in cands:
+            if os.path.isfile(c):
+                with open(c, "rb") as f: return f.read(), "cache"
+        return None, f"only box path, not fetchable here ({name})"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:100]}"
+
+
+def send_image(cfg, target, data, client=None):
+    """Upload bytes via im/v1/images (message) and send msg_type image. Returns (ok, msg)."""
+    import io
+    from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+    client = client or lark_client(cfg["app_id"], cfg["app_secret"])
+    req = CreateImageRequest.builder().request_body(
+        CreateImageRequestBody.builder().image_type("message").image(io.BytesIO(data)).build()).build()
+    resp = client.im.v1.image.create(req)
+    if not resp.success(): return False, f"upload code={resp.code} msg={resp.msg}"
+    return send_text(cfg, target, "", client, "image", json.dumps({"image_key": resp.data.image_key}))
+
+
 def read_transcript(path):
     """-> [(seq, id, role, body, title)] ordered by seq; 1:1 mirror of the visible chat.
     roles: user (haohao typed), agent_in (fromAgent), agent_out (assistant message with toAgent), assistant (SendToUser text)."""
     with open(path, encoding="utf-8") as f: j = json.load(f)
-    out = []
+    out = []; imgs_map = _IMAGES[path] = {}
     for e in (j.get("value") or {}).get("entries") or []:
         k, seq, eid = e.get("kind"), e.get("seq"), e.get("id")
         if seq is None or not eid or e.get("isStreaming"): continue
@@ -474,6 +527,8 @@ def read_transcript(path):
             out.append((seq, eid, "agent_out", e.get("content") or "", ("→ " + n) if n else ""))
         elif k == "send-message":
             m = e.get("message") or {}
+            imgs = _image_urls(m)
+            if imgs and not e.get("toAgent") and not m.get("toAgent"): imgs_map[eid] = (seq, imgs)
             if m.get("type") == "text" and not e.get("toAgent") and not m.get("toAgent") and not m.get("widget"):
                 out.append((seq, eid, "assistant", m.get("content") or "", ""))
             elif m.get("type") == "widget" or (m.get("widget") and not e.get("toAgent")):
@@ -674,7 +729,29 @@ class ChatSync:
                 self.log(bid, f"已同步到{where} {role} seq={seq}")
                 st["sent"] = (st["sent"] + [eid])[-500:]
             st["seq"] = seq; self._save(sp, st)
+        self._images(bid, b, rows, st, sp, client, path)
         self.mtimes[key] = m
+
+    def _images(self, bid, b, rows, st, sp, client, path):
+        """Send images of SendToUser messages after their text, to the same destination. Deduped via img_sent."""
+        if "img_floor" not in st:
+            st["img_floor"] = (rows[-1][0] - 30) if rows else 0; st["img_sent"] = []  # small backfill on first run
+        for eid, (seq, urls) in sorted(_IMAGES.get(path, {}).items(), key=lambda x: x[1][0]):
+            if seq <= st["img_floor"] or eid in st["img_sent"]: continue
+            if seq > st.get("seq", 0): continue  # wait until text is processed
+            g = self.get_group(bid)
+            use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
+            dest = (g.get("message_id") or g["chat_id"]) if use_group else b["sync_chat_id"]
+            for i, u in enumerate(urls):
+                data, how = resolve_image(u)
+                if data is None:
+                    self.log(bid, f"图片未同步 seq={seq} #{i + 1}: {how}", "warn"); continue
+                ok, msg = send_image(b, dest, data, client[1])
+                if not ok and use_group and dest.startswith("om_"): ok, msg = send_image(b, g["chat_id"], data, client[1])
+                where = "群" if use_group else "单聊"
+                self.log(bid, f"图片已同步到{where} seq={seq} #{i + 1} ({how}) code=0 mid={msg}" if ok else f"图片发送失败 seq={seq} #{i + 1} {msg}",
+                         "info" if ok else "warn")
+            st["img_sent"] = (st["img_sent"] + [eid])[-500:]; self._save(sp, st)
 
     def _to_tally(self, bid, b, chat_id, message_id, text):
         """Bridge posted a non-Tally bot's message into Tally's GROUP_ALL group -> also POST it to Tally's webhook
