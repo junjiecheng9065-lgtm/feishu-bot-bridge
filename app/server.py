@@ -161,6 +161,16 @@ def create_app(store: core.Store, mgr: core.Manager, on_show=None):
         mgr.log("system", f"从配置文件导入 {n} 个机器人（均为未启用状态）")
         return {"imported": n}
 
+    @app.get("/api/settings")
+    def get_settings(): return {"user_display_name": store.user_name()}
+
+    @app.post("/api/settings")
+    def set_settings(body: dict = Body(...)):
+        if "user_display_name" in body:
+            v = str(body.get("user_display_name") or "").strip()[:40] or core.DEFAULT_USER_NAME
+            with store.lock: store.data["settings"]["user_display_name"] = v; store.save()
+        return {"user_display_name": store.user_name()}
+
     @app.get("/api/autostart")
     def get_auto(): return {"enabled": autostart.is_enabled()}
 

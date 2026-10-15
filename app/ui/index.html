@@ -182,11 +182,14 @@ function renderSettings(){
  $('#title').innerHTML='设置';$('#topacts').innerHTML='';
  $('#content').innerHTML=`<div class="wide"><div class="card"><h4>常规</h4>
   <div class="row"><div>开机自启<small>登录后最小化到托盘运行</small></div><label class="sw"><input type="checkbox" id="auto" ${status.autostart?'checked':''}><span></span></label></div>
+  <div class="row"><div>我的显示名<small>Grok 里自己发的消息同步到飞书时的卡片标题</small></div><input id="uname" style="width:160px" maxlength="40" placeholder="桔子"></div>
   <div class="row"><div>关闭窗口<small>关闭按钮会隐藏到托盘；从托盘菜单「退出」才会结束程序</small></div></div></div>
   <div class="card"><h4>本地接口</h4><div class="row"><div>回复接口<small>POST <code>http://127.0.0.1:${status.port}/reply</code>，需 <code>Authorization: Bearer &lt;本地 token&gt;</code></small></div></div>
   <div class="row"><div>数据目录<small><code>${esc(status.data_dir)}</code></small></div></div></div>
   <div class="card"><h4>导入</h4><div class="row"><div>从旧版 feishu-bridge 导入<small>导入的机器人默认未启用</small></div><button class="btn" onclick="doImport()">导入旧配置</button></div></div>
   <div class="card"><h4>关于</h4><div class="row"><div>飞书 Bot 桥 v${status.version||''}<small>Feishu ↔ Grok Bot 消息桥</small></div></div></div></div>`;
+ api('/api/settings').then(r=>{const u=$('#uname');if(u)u.value=r.user_display_name||''}).catch(()=>{});
+ $('#uname').onchange=async e=>{try{const r=await api('/api/settings',{method:'POST',body:JSON.stringify({user_display_name:e.target.value})});e.target.value=r.user_display_name;toast('显示名已保存：'+r.user_display_name)}catch(x){toast(x.message,1)}};
  $('#auto').onchange=async e=>{try{const r=await api('/api/autostart',{method:'POST',body:JSON.stringify({enabled:e.target.checked})});toast(r.enabled?'已开启开机自启':'已关闭开机自启')}catch(x){toast(x.message,1)}}}
 refresh().then(()=>render(true));setInterval(refresh,3000);
 </script></body></html>

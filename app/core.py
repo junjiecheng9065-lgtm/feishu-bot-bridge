@@ -2,8 +2,9 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 ACK_TEXT = "收到，处理中…"
+DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
 SECRET_FIELDS = {"app_secret", "webhook_key"}
@@ -27,7 +28,7 @@ class Store:
     def __init__(self):
         self.path = os.path.join(data_dir(), "config.json")
         self.lock = threading.Lock()
-        self.data = {"bots": {}, "settings": {"port": 8765, "autostart": False}}
+        self.data = {"bots": {}, "settings": {"port": 8765, "autostart": False, "user_display_name": DEFAULT_USER_NAME}}
         if os.path.exists(self.path):
             with open(self.path, encoding="utf-8") as f:
                 self.data.update(json.load(f))
@@ -39,6 +40,9 @@ class Store:
         os.replace(tmp, self.path)
         try: os.chmod(self.path, 0o600)
         except OSError: pass
+
+    def user_name(self):
+        return str(self.data.get("settings", {}).get("user_display_name") or DEFAULT_USER_NAME).strip() or DEFAULT_USER_NAME
 
     def bots(self):
         return dict(self.data["bots"])
@@ -442,7 +446,7 @@ def read_transcript(path):
                 fa = e["fromAgent"]
                 if isinstance(fa, dict): _FROM_IDS[eid] = str(fa.get("id") or fa.get("agentId") or fa.get("agent_id") or "")
                 out.append((seq, eid, "agent_in", e.get("content") or "", _agent_name(fa) or "Agent"))
-            elif _is_human_user(e): out.append((seq, eid, "user", e.get("content") or "", "haohao"))
+            elif _is_human_user(e): out.append((seq, eid, "user", e.get("content") or "", "user"))
         elif k == "message" and e.get("role") == "assistant" and e.get("toAgent"):
             n = _agent_name(e["toAgent"])
             out.append((seq, eid, "agent_out", e.get("content") or "", ("→ " + n) if n else ""))
@@ -603,7 +607,7 @@ class ChatSync:
                 def _st(bb, d, tx, cl, mt, ct, _lc=_last_content):
                     _lc[0] = ct; return send_text(bb, d, tx, cl, mt, ct)
                 if role == "user":
-                    ok, msg = _st(b, dest, "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
+                    ok, msg = _st(b, dest, "", client[1], "interactive", _card(self.store.user_name(), "wathet", t[:9000]))
                 elif role == "widget":
                     ok, msg = _st(b, dest, "", client[1], "interactive",
                                         json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False))
