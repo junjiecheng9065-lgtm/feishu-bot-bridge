@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.11"
+VERSION = "0.2.12"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -599,14 +599,21 @@ class ChatSync:
                     if tg and tg.get("chat_id"):
                         nm = b.get("name") or bid
                         self.set_group(bid, {"chat_id": tg["chat_id"], "prefix": nm})
+                        fl = self._first_line(t)
+                        if not self._dedupe(tg["chat_id"] + "|派|" + nm + "|" + fl):
+                            pok, pmsg = send_text(b, tg["chat_id"], "", client[1], "interactive",
+                                _card(f"Tally → {nm}：已派", "blue", fl or "…"))
+                            self.log(bid, f"已派到群 {nm}" if pok else f"已派卡片失败 {pmsg}", "info" if pok else "warn")
                         aok, amsg = send_text(b, tg["chat_id"], f"{nm} {ACK_TEXT}", client[1])
                         self.log(bid, f"Tally 派单，已在群里确认" if aok else f"群确认失败 {amsg}", "info" if aok else "warn")
                         dispatched = True
                 if role in ("agent_in", "agent_out"):
                     ag = self.get_group(bid)
                     if ag and ag.get("chat_id") and ag["chat_id"] != b.get("sync_chat_id"):
-                        self._mirror_agent(bid, b, role, title, t, client[1])  # group only, no p2p
+                        # group ctx: only key-node cards (已派 / 完成·卡住); else Grok-only (no group, no p2p)
+                        self._key_agent(bid, b, role, title, t, client[1])
                         st["sent"] = (st["sent"] + [eid])[-500:]; st["seq"] = seq; self._save(sp, st); continue
+                    # no group ctx: fall through → p2p 1:1
                 g = self.get_group(bid) if role in ("assistant", "widget") else None
                 use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
                 if role == "user":
@@ -673,26 +680,51 @@ class ChatSync:
             self.log(tb["id"], f"bot 群消息转发失败 来自 {p['bot_name']}", "warn")
         threading.Thread(target=go, daemon=True).start()
 
-    def _mirror_agent(self, bid, b, role, title, t, client):
-        """bot<->bot message -> group card 「from → to」 once (deduped across sender/receiver transcripts)."""
-        g = self.get_group(bid)
-        if not (g and g.get("chat_id") and g["chat_id"] != b.get("sync_chat_id")): return
-        me = b.get("name") or bid
-        other = title.lstrip("→ ").strip() if role == "agent_out" else title.strip()
-        hdr = f"{me} → {other or 'Agent'}" if role == "agent_out" else f"{other or 'Agent'} → {me}"
+    def _first_line(self, t, n=60):
+        line = (t or "").split("\n", 1)[0].strip().replace("\r", "")
+        return (line[:n] + "…") if len(line) > n else line
+
+    def _dedupe(self, key, file="groupmirror.json", ttl=3600):
         import hashlib
-        h = hashlib.sha1((g["chat_id"] + "\n" + t[:4000]).encode("utf-8")).hexdigest()
-        dp = os.path.join(data_dir(), "groupmirror.json"); now = time.time()
+        h = key if len(key) == 40 and all(c in "0123456789abcdef" for c in key) else hashlib.sha1(key.encode("utf-8")).hexdigest()
+        dp = os.path.join(data_dir(), file); now = time.time()
         with self.gmu:
             try:
                 with open(dp, encoding="utf-8") as f: seen = json.load(f)
             except (OSError, ValueError): seen = {}
-            seen = {k: v for k, v in seen.items() if now - v < 3600}
-            if h in seen: return
-            seen[h] = now; self._save(dp, seen)
-        ok, msg = send_text(b, g["chat_id"], "", client, "interactive", _card(hdr, "purple", t[:9000]))
-        if ok and other.lower() != "tally": self._to_tally(bid, b, g["chat_id"], msg if str(msg).startswith("om_") else "", f"[{hdr}] {t}")
-        self.log(bid, f"已镜像到群 {hdr}" if ok else f"群镜像失败 {msg}", "info" if ok else "warn")
+            seen = {k: v for k, v in seen.items() if now - v < ttl}
+            if h in seen: return True
+            seen[h] = now; self._save(dp, seen); return False
+
+    def _key_agent(self, bid, b, role, title, t, client):
+        """With group ctx: only 已派 (Tally→bot) or 完成/卡住 (bot→Tally). Else stay in Grok."""
+        g = self.get_group(bid)
+        if not (g and g.get("chat_id") and g["chat_id"] != b.get("sync_chat_id")): return
+        me = b.get("name") or bid
+        other = title.lstrip("→ ").strip() if role == "agent_out" else title.strip()
+        # (1) 已派: Tally → bot
+        if (role == "agent_out" and b.get("agent_id") == TALLY_AGENT_ID) or (
+                role == "agent_in" and b.get("agent_id") != TALLY_AGENT_ID and title.strip().lower() == "tally"):
+            bot_name = other if role == "agent_out" else me
+            fl = self._first_line(t)
+            if self._dedupe(g["chat_id"] + "|派|" + bot_name + "|" + fl): return
+            hdr = f"Tally → {bot_name}：已派"
+            ok, msg = send_text(b, g["chat_id"], "", client, "interactive", _card(hdr, "blue", fl or "…"))
+            self.log(bid, f"已派到群 {bot_name}" if ok else f"已派卡片失败 {msg}", "info" if ok else "warn")
+            return
+        # (3) bot → Tally with done/blocked markers only (post from bot's agent_out)
+        if role == "agent_out" and other.lower() == "tally":
+            low = t.lower()
+            if not (any(m in t for m in ("完成", "已完成", "卡住", "失败")) or any(m in low for m in ("done", "blocked", "fail"))):
+                return
+            fl = self._first_line(t)
+            if self._dedupe(g["chat_id"] + "|结|" + me + "|" + fl): return
+            hdr = f"{me} → Tally"
+            ok, msg = send_text(b, g["chat_id"], "", client, "interactive", _card(hdr, "purple", fl or "…"))
+            if ok: self._to_tally(bid, b, g["chat_id"], msg if str(msg).startswith("om_") else "", f"[{hdr}] {fl}")
+            self.log(bid, f"已同步到群 {hdr}" if ok else f"群卡片失败 {msg}", "info" if ok else "warn")
+            return
+        # other agent messages with group ctx: Grok only
 
     def _save(self, p, st):
         tmp = p + ".tmp"
