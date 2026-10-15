@@ -1,18 +1,28 @@
 name: build
 on: { push: { tags: ["v*"] }, workflow_dispatch: {} }
+permissions: { contents: write }
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix: { os: [windows-latest, macos-latest, ubuntu-22.04] }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - name: Linux webview deps (GTK/WebKit)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 libgirepository1.0-dev libcairo2-dev gir1.2-webkit2-4.0 libwebkit2gtk-4.0-37
+          pip install "PyGObject<3.51" || echo "PyGObject unavailable; Linux build will fall back to browser"
       - run: pip install -r requirements.txt
       - name: PyInstaller (Windows)
         if: runner.os == 'Windows'
-        run: pyinstaller -y --onefile --noconsole --name FeishuBotBridge --add-data "app/ui;ui" --collect-submodules lark_oapi --hidden-import pystray._win32 run.py
+        run: |
+          pyinstaller -y --onefile --noconsole --name FeishuBotBridge --icon assets/icon.ico --add-data "app/ui;ui" --add-data "assets;assets" --collect-submodules lark_oapi --collect-all webview --hidden-import clr --hidden-import pystray._win32 run.py
+          Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile installer\MicrosoftEdgeWebview2Setup.exe
       - name: NSIS installer
         if: runner.os == 'Windows'
         run: |
@@ -21,24 +31,38 @@ jobs:
       - name: PyInstaller (macOS .app + dmg)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller -y --windowed --name FeishuBotBridge --add-data "app/ui:ui" --collect-submodules lark_oapi --hidden-import pystray._darwin run.py
+          python -c "from PIL import Image; Image.open('assets/icon.png').save('assets/icon.icns')"
+          pyinstaller -y --windowed --name FeishuBotBridge --icon assets/icon.icns --add-data "app/ui:ui" --add-data "assets:assets" --collect-submodules lark_oapi --collect-all webview --hidden-import pystray._darwin run.py
           hdiutil create -volname FeishuBotBridge -srcfolder dist/FeishuBotBridge.app -ov -format UDZO dist/FeishuBotBridge.dmg
       - name: PyInstaller (Linux AppImage)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y libfuse2
-          pyinstaller -y --onefile --name FeishuBotBridge --add-data "app/ui:ui" --collect-submodules lark_oapi --hidden-import pystray._xorg run.py
+          pyinstaller -y --onefile --name FeishuBotBridge --add-data "app/ui:ui" --add-data "assets:assets" --collect-submodules lark_oapi --collect-all webview --hidden-import pystray._xorg run.py
           mkdir -p AppDir/usr/bin && cp dist/FeishuBotBridge AppDir/usr/bin/
-          printf '[Desktop Entry]\nType=Application\nName=FeishuBotBridge\nExec=FeishuBotBridge\nIcon=icon\nCategories=Network;\n' > AppDir/app.desktop
-          python -c "from PIL import Image; Image.new('RGB',(256,256),(51,112,255)).save('AppDir/icon.png')"
+          printf '[Desktop Entry]\nType=Application\nName=飞书 Bot 桥\nExec=FeishuBotBridge\nIcon=icon\nCategories=Network;\n' > AppDir/app.desktop
+          cp assets/icon.png AppDir/icon.png
           printf '#!/bin/sh\nexec "$(dirname "$0")/usr/bin/FeishuBotBridge" "$@"\n' > AppDir/AppRun && chmod +x AppDir/AppRun
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool && chmod +x appimagetool
           ARCH=x86_64 ./appimagetool AppDir dist/FeishuBotBridge-x86_64.AppImage
       - uses: actions/upload-artifact@v4
         with:
           name: FeishuBotBridge-${{ runner.os }}
+          if-no-files-found: error
           path: |
             dist/FeishuBotBridge-Setup.exe
             dist/FeishuBotBridge.exe
             dist/FeishuBotBridge.dmg
             dist/FeishuBotBridge-x86_64.AppImage
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out, merge-multiple: true }
+      - run: ls -la out
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: 飞书 Bot 桥 ${{ github.ref_name }}
+          generate_release_notes: true
+          files: out/*

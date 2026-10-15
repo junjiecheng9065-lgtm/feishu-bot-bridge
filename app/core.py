@@ -2,6 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
+VERSION = "0.2.0"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -226,6 +227,10 @@ class Manager:
 
     def _add(self, e):
         self.logs.append(e)
+        m = e.get("msg", "")
+        if m.startswith("已转发"): self.status.setdefault(e["bot"], {"restarts": 0})["last_msg_at"] = e["ts"]
+        elif m.startswith("已同步"): self.status.setdefault(e["bot"], {"restarts": 0})["last_sync_at"] = e["ts"]
+        elif m.startswith("聊天同步异常"): self.status.setdefault(e["bot"], {"restarts": 0})["sync_error_at"] = e["ts"]
         try:
             with open(self.logfile, "a", encoding="utf-8") as f:
                 f.write(f"{time.strftime('%F %T', time.localtime(e['ts']))} [{e['bot']}] {e['level']} {e['msg']}\n")

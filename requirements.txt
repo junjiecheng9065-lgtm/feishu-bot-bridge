@@ -4,3 +4,4 @@ uvicorn
 pystray
 pillow
 pyinstaller
+pywebview>=5.3

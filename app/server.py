@@ -30,7 +30,7 @@ class ReplyIn(BaseModel):
     text: str
 
 
-def create_app(store: core.Store, mgr: core.Manager):
+def create_app(store: core.Store, mgr: core.Manager, on_show=None):
     app = FastAPI(title="飞书 Bot 桥")
     token = store.data["settings"].get("api_token")
     if not token:
@@ -49,12 +49,19 @@ def create_app(store: core.Store, mgr: core.Manager):
     def view(bid, b):
         p = core.public(b); st = mgr.status.get(bid, {})
         p.update(id=bid, state=mgr.state(bid), restarts=st.get("restarts", 0),
-                 started_at=st.get("started_at"), connected_at=st.get("connected_at"))
+                 started_at=st.get("started_at"), connected_at=st.get("connected_at"),
+                 last_msg_at=st.get("last_msg_at"), last_sync_at=st.get("last_sync_at"),
+                 sync_error=bool(st.get("sync_error_at") and st.get("sync_error_at") > (st.get("last_sync_at") or 0)))
         return p
 
     @app.get("/", response_class=HTMLResponse)
     def index():
         return open(os.path.join(UI_DIR, "index.html"), encoding="utf-8").read()
+
+    @app.get("/icon.png")
+    def icon():
+        from fastapi.responses import FileResponse
+        return FileResponse(os.path.join(UI_DIR, "icon.png"))
 
     @app.get("/api/bots")
     def list_bots():
@@ -125,7 +132,7 @@ def create_app(store: core.Store, mgr: core.Manager):
     def status(request: Request):
         bots = store.bots()
         return {"bots": {k: mgr.state(k) for k in bots}, "data_dir": core.data_dir(),
-                "autostart": autostart.is_enabled(), "port": request.url.port}
+                "autostart": autostart.is_enabled(), "version": core.VERSION, "port": request.url.port}
 
     @app.get("/api/logs")
     def logs(bot: str | None = None, limit: int = 200):
@@ -161,6 +168,14 @@ def create_app(store: core.Store, mgr: core.Manager):
     def set_auto(body: dict = Body(...)):
         autostart.set_enabled(bool(body.get("enabled")))
         return {"enabled": autostart.is_enabled()}
+
+    @app.get("/api/ping")
+    def ping(): return {"app": core.APP_NAME, "version": core.VERSION}
+
+    @app.post("/api/show")
+    def show():
+        if on_show: on_show()
+        return {"ok": True}
 
     @app.get("/api/token")
     def get_token(): return {"token": token}
