@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.15"
+VERSION = "0.2.16"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -611,7 +611,7 @@ class ChatSync:
                         nm = b.get("name") or bid
                         self.set_group(bid, {"chat_id": tg["chat_id"], "prefix": nm, "dispatched": True})
                         if not self._task(tg["chat_id"], nm, "处理中", task=self._first_line(t)):
-                            aok, amsg = send_text(b, tg["chat_id"], f"{nm} {ACK_TEXT}", client[1])  # fallback ack
+                            aok, amsg = send_text(b, tg["chat_id"], ACK_TEXT, client[1])  # fallback ack
                             self.log(bid, f"Tally 派单，已在群里确认" if aok else f"群确认失败 {amsg}", "info" if aok else "warn")
                         dispatched = True
                 if role in ("agent_in", "agent_out"):
@@ -629,10 +629,13 @@ class ChatSync:
                     dest = g.get("message_id") or g["chat_id"]
                 else:
                     dest = b["sync_chat_id"]
-                _last_content = [None]
+                _last_content = [None, "interactive"]
                 def _st(bb, d, tx, cl, mt, ct, _lc=_last_content):
-                    _lc[0] = ct; return send_text(bb, d, tx, cl, mt, ct)
-                if role == "user":
+                    _lc[0] = ct; _lc[1] = mt; return send_text(bb, d, tx, cl, mt, ct)
+                _ack = t.strip().rstrip("。.").replace("...", "…") in (ACK_TEXT, "收到，处理中", "收到,处理中…")
+                if _ack and role not in ("user", "widget"):  # ack = plain text, never a card
+                    ok, msg = _st(b, dest, "", client[1], "text", json.dumps({"text": ACK_TEXT}, ensure_ascii=False))
+                elif role == "user":
                     ok, msg = _st(b, dest, "", client[1], "interactive", _card(self.store.user_name(), "wathet", t[:9000]))
                 elif role == "widget":
                     ok, msg = _st(b, dest, "", client[1], "interactive",
@@ -649,7 +652,7 @@ class ChatSync:
                     ok, msg = _st(b, dest, "", client[1], "interactive", _md_card(t[:9000]))
                 if not ok and use_group and role != "user" and dest.startswith("om_"):
                     self.log(bid, f"群回复失败 {msg}，改为直接发到群", "warn")
-                    ok, msg = send_text(b, g["chat_id"], "", client[1], "interactive", _last_content[0])
+                    ok, msg = send_text(b, g["chat_id"], "", client[1], _last_content[1], _last_content[0])
                 if not ok: raise RuntimeError(f"发送失败 {msg}")
                 if use_group and role != "user":
                     self._to_tally(bid, b, g["chat_id"], msg if str(msg).startswith("om_") else "",
