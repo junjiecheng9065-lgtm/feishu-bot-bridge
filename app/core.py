@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -365,21 +365,47 @@ def _is_human_user(e):
     return True
 
 
+def _agent_name(v):
+    if isinstance(v, dict):
+        return str(v.get("name") or v.get("title") or v.get("label") or v.get("displayName") or "").strip()
+    return ""
+
+
+def _visible(e):
+    """Skip only content not visible in the Grok chat (hidden prompts, reminders, task notices, voice nudges)."""
+    if e.get("hidden") or e.get("isHidden"): return False
+    meta = e.get("metadata") or e.get("meta") or {}
+    if isinstance(meta, dict):
+        if meta.get("hidden"): return False
+        for k in ("kind", "type", "source", "origin"):
+            v = str(meta.get(k) or "").lower()
+            if any(x in v for x in ("system", "background", "voice", "hidden", "nudge")): return False
+    if ":" in str(e.get("clientNonce") or ""): return False
+    c = (e.get("content") or "").lstrip()
+    if any(m in c for m in _HIDDEN_MARKS[:1]) or any(c.startswith(m) for m in _HIDDEN_MARKS[1:5]): return False
+    return True
+
+
 def read_transcript(path):
-    """-> [(seq, id, role, body)] ordered by seq.
-    user = message/role user typed by haohao (no fromAgent/channel/author, no hidden/system/automation markers);
-    assistant = only SendToUser text (kind send-message, message.type text), never toAgent replies or widgets."""
+    """-> [(seq, id, role, body, title)] ordered by seq; 1:1 mirror of the visible chat.
+    roles: user (haohao typed), agent_in (fromAgent), agent_out (assistant message with toAgent), assistant (SendToUser text)."""
     with open(path, encoding="utf-8") as f: j = json.load(f)
     out = []
     for e in (j.get("value") or {}).get("entries") or []:
         k, seq, eid = e.get("kind"), e.get("seq"), e.get("id")
-        if seq is None or not eid: continue
-        if k == "message" and e.get("role") == "user" and not e.get("isStreaming"):
-            if _is_human_user(e): out.append((seq, eid, "user", e.get("content") or ""))
+        if seq is None or not eid or e.get("isStreaming"): continue
+        if k == "message" and e.get("role") == "user":
+            if not _visible(e): continue
+            if e.get("fromAgent"):
+                out.append((seq, eid, "agent_in", e.get("content") or "", _agent_name(e["fromAgent"]) or "Agent"))
+            elif _is_human_user(e): out.append((seq, eid, "user", e.get("content") or "", "haohao"))
+        elif k == "message" and e.get("role") == "assistant" and e.get("toAgent"):
+            n = _agent_name(e["toAgent"])
+            out.append((seq, eid, "agent_out", e.get("content") or "", ("→ " + n) if n else ""))
         elif k == "send-message":
             m = e.get("message") or {}
             if m.get("type") == "text" and not e.get("toAgent") and not m.get("toAgent") and not m.get("widget"):
-                out.append((seq, eid, "assistant", m.get("content") or ""))
+                out.append((seq, eid, "assistant", m.get("content") or "", ""))
     out.sort(key=lambda r: r[0]); return out
 
 
@@ -392,6 +418,12 @@ def _card(title, template, md):
 def _md_card(md):
     """Headerless card whose markdown element renders links, bold, lists, code."""
     return json.dumps({"config": {"wide_screen_mode": True, "update_multi": True},
+        "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
+
+
+def _md_card_t(title, md):
+    return json.dumps({"config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {"title": {"tag": "plain_text", "content": title}, "template": "grey"},
         "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
 
 
@@ -429,11 +461,13 @@ class ChatSync:
         client = self.clients.get(bid)
         if not client or client[0] != (b["app_id"], b["app_secret"]):
             client = ((b["app_id"], b["app_secret"]), lark_client(b["app_id"], b["app_secret"])); self.clients[bid] = client
-        for seq, eid, role, body in rows:
+        for seq, eid, role, body, title in rows:
             if seq <= st["seq"]: continue
             t = body.strip()
             if eid not in st["sent"] and t and not t.startswith("飞书"):
                 if role == "user": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
+                elif role == "agent_in": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card(title, "purple", t[:9000]))
+                elif title: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card_t(title, t[:9000]))
                 else: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card(t[:9000]))
                 if not ok: raise RuntimeError(f"发送失败 {msg}")
                 self.log(bid, f"已同步 {role} seq={seq}")
