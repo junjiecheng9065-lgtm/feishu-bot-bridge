@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.20"
+VERSION = "0.2.22"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -153,6 +153,56 @@ def fetch_bot_open_id(cfg):
         return ""
 
 
+def _safe_json(x):
+    try: return json.loads(x or "{}")
+    except ValueError: return {}
+
+
+def _feishu_image_keys(msg_type, c):
+    if msg_type == "image": return [c["image_key"]] if c.get("image_key") else []
+    keys = []
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("tag") == "img" and o.get("image_key"): keys.append(o["image_key"])
+            for v in o.values(): walk(v)
+        elif isinstance(o, list):
+            for v in o: walk(v)
+    if msg_type == "post": walk(c)
+    return keys
+
+
+def _post_text(c):
+    body = c.get("content") if "content" in c else next((v.get("content") for v in c.values() if isinstance(v, dict)), [])
+    title = c.get("title") or ""
+    lines = [title] if title else []
+    for para in body or []:
+        lines.append("".join(x.get("text", "") or (("@" + x.get("user_name", "")) if x.get("tag") == "at" else "")
+                             for x in para if isinstance(x, dict)))
+    return "\n".join(l for l in lines if l).strip()
+
+
+def download_message_image(cfg, message_id, file_key, client=None):
+    """GET im/v1/messages/:id/resources/:key?type=image -> (True, {path, base64, mime, image_key}) | (False, err)."""
+    import base64
+    from lark_oapi.api.im.v1 import GetMessageResourceRequest
+    try:
+        client = client or lark_client(cfg["app_id"], cfg["app_secret"])
+        req = GetMessageResourceRequest.builder().message_id(message_id).file_key(file_key).type("image").build()
+        resp = client.im.v1.message_resource.get(req)
+        if not resp.success(): return False, f"code={resp.code} msg={resp.msg}"
+        data = resp.file.read()
+        ext = ".png" if data[:4] == b"\x89PNG" else ".gif" if data[:3] == b"GIF" else ".webp" if data[8:12] == b"WEBP" else ".jpg"
+        mime = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp", ".jpg": "image/jpeg"}[ext]
+        d = os.path.join(data_dir(), "inbox_images"); os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{message_id}_{file_key[-12:]}{ext}")
+        with open(path, "wb") as f: f.write(data)
+        info = {"path": path, "mime": mime, "image_key": file_key, "bytes": len(data)}
+        info["base64"] = base64.b64encode(data).decode() if len(data) <= 4 * 1024 * 1024 else ""
+        return True, info
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:100]}"
+
+
 # ---------------- worker (child process, one per bot) ----------------
 def worker_main(cfg, other_bot_names, q, seen_path):
     def log(msg, level="info"):
@@ -198,10 +248,20 @@ def worker_main(cfg, other_bot_names, q, seen_path):
                 c = json.loads(m.content or "{}"); text = c.get("text") or m.content
             except ValueError:
                 text = m.content
+            keys = _feishu_image_keys(m.message_type, c if isinstance(c := _safe_json(m.content), dict) else {})
+            if m.message_type == "post" and isinstance(c, dict): text = _post_text(c) or text
             for x in mentions:
                 if isinstance(text, str) and x.key: text = text.replace(x.key, "@" + (x.name or ""))
+            imgs = []
+            for ik in keys:
+                ok_i, info = download_message_image(cfg, mid, ik, client)
+                if ok_i: imgs.append(info); log(f"已下载飞书图片 {mid} {info['bytes']} 字节 → {info['path']}")
+                else: log(f"飞书图片下载失败 {mid} {info}", "warn")
+            if m.message_type == "image": text = ""
+            if imgs: text = ((text or "").strip() + f"\n[附图 {len(imgs)} 张：" + ", ".join(i["path"] for i in imgs) + "]").strip()
             p = {"chat_id": m.chat_id, "message_id": mid, "chat_type": m.chat_type, "sender_open_id": sid,
                  "text": text, "bot_slug": cfg.get("slug") or cfg["id"], "bot_name": cfg.get("name", "")}
+            if imgs: p["images"] = imgs
             if group_all: p["group_all"] = True
             for attempt in range(5):
                 st, body = post_webhook(cfg["webhook_url"], cfg["webhook_key"], p)
