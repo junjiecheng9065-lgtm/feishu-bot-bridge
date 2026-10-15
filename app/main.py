@@ -18,7 +18,7 @@ def run():
     if not a.no_autostart_bots: mgr.start_enabled()
     app = server.create_app(store, mgr)
     url = f"http://127.0.0.1:{port}/"
-    cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", log_config=None)  # use root file logging; default config crashes when stdout is None
     srv = uvicorn.Server(cfg)
 
     def open_ui():
@@ -38,7 +38,7 @@ def run():
                 pystray.MenuItem("退出", lambda i, *_: (quit_all(), i.stop()))))
             threading.Thread(target=icon.run, daemon=True).start()
         except Exception as e:
-            print("托盘不可用:", e)
+            import logging; logging.getLogger("app").warning("托盘不可用: %s", e)
     if not a.background:
         threading.Timer(1.2, open_ui).start()
     print(f"飞书 Bot 桥 运行于 {url}  数据目录 {core.data_dir()}", flush=True)
