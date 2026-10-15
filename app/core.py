@@ -4,7 +4,7 @@ import json, os, re, sys, time, threading, uuid, collections, multiprocessing as
 APP_NAME = "FeishuBotBridge"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
-          "bot_open_id", "group_all", "enabled"]
+          "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
 SECRET_FIELDS = {"app_secret", "webhook_key"}
 
 
@@ -49,7 +49,8 @@ class Store:
         with self.lock:
             cur = self.data["bots"].get(bid) or {"id": bid, "name": "", "app_id": "", "app_secret": "",
                 "webhook_url": "", "webhook_key": "", "owner_open_id": "", "bot_open_id": "",
-                "group_all": False, "enabled": False}
+                "group_all": False, "enabled": False,
+                "agent_id": "", "sync_chat_id": "", "sync_enabled": False}
             for k in FIELDS:
                 if k in fields and fields[k] is not None:
                     if k in SECRET_FIELDS and fields[k] == "": continue  # blank = keep existing secret
@@ -92,19 +93,19 @@ def lark_client(app_id, app_secret):
     return lark.Client.builder().app_id(app_id).app_secret(app_secret).log_level(lark.LogLevel.ERROR).build()
 
 
-def send_text(cfg, target, text, client=None):
+def send_text(cfg, target, text, client=None, msg_type="text", content=None):
     """target: om_xxx -> reply to message; oc_xxx -> send to chat. Returns (ok, msg)."""
     from lark_oapi.api.im.v1 import (ReplyMessageRequest, ReplyMessageRequestBody,
         CreateMessageRequest, CreateMessageRequestBody)
     client = client or lark_client(cfg["app_id"], cfg["app_secret"])
-    content = json.dumps({"text": text}, ensure_ascii=False)
+    if content is None: content = json.dumps({"text": text}, ensure_ascii=False)
     if target.startswith("om_"):
         req = ReplyMessageRequest.builder().message_id(target).request_body(
-            ReplyMessageRequestBody.builder().msg_type("text").content(content).build()).build()
+            ReplyMessageRequestBody.builder().msg_type(msg_type).content(content).build()).build()
         resp = client.im.v1.message.reply(req)
     elif target.startswith("oc_"):
         req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(
-            CreateMessageRequestBody.builder().receive_id(target).msg_type("text").content(content).build()).build()
+            CreateMessageRequestBody.builder().receive_id(target).msg_type(msg_type).content(content).build()).build()
         resp = client.im.v1.message.create(req)
     else:
         return False, "target 必须以 om_ 或 oc_ 开头"
@@ -218,6 +219,7 @@ class Manager:
         self.mu = threading.Lock()
         threading.Thread(target=self._drain, daemon=True).start()
         threading.Thread(target=self._supervise, daemon=True).start()
+        self.sync = ChatSync(store, self.log)
 
     def log(self, bot, msg, level="info"):
         self._add({"bot": bot, "ts": time.time(), "level": level, "msg": msg})
@@ -306,6 +308,106 @@ class Manager:
         for bid in list(self.procs): self.stop(bid)
 
 
+# ---------------- Grok Bot chat -> Feishu sync (local transcript replicas, same machine only) ----------------
+def grok_store_dir():
+    if os.environ.get("GROK_BOT_PERSISTENCE_DIR"): return os.environ["GROK_BOT_PERSISTENCE_DIR"]
+    if sys.platform == "win32": base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    elif sys.platform == "darwin": base = os.path.expanduser("~/Library/Application Support")
+    else: base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return os.path.join(base, "Grok Bot", "sand-client-persistence")
+
+
+def _b32name(n):
+    import base64
+    try: return base64.b32decode(n.upper() + "=" * (-len(n) % 8)).decode("utf-8", "replace")
+    except Exception: return ""
+
+
+def find_transcript(agent_id):
+    """Newest local replica file for this agent (across signed-in accounts) or None."""
+    d = grok_store_dir(); best = None
+    try: names = os.listdir(d)
+    except OSError: return None
+    for fn in names:
+        if not fn.endswith(".blob"): continue
+        if not _b32name(fn[:-5]).endswith(".transcript.replicas." + agent_id): continue
+        p = os.path.join(d, fn); m = os.path.getmtime(p)
+        if not best or m > best[0]: best = (m, p)
+    return best and best[1]
+
+
+def read_transcript(path):
+    """-> [(seq, id, role, body)] ordered by seq. user = message/role user; assistant = send-message text."""
+    with open(path, encoding="utf-8") as f: j = json.load(f)
+    out = []
+    for e in (j.get("value") or {}).get("entries") or []:
+        k, seq, eid = e.get("kind"), e.get("seq"), e.get("id")
+        if seq is None or not eid: continue
+        if k == "message" and e.get("role") in ("user", "assistant") and not e.get("isStreaming"):
+            out.append((seq, eid, e["role"], e.get("content") or ""))
+        elif k == "send-message" and (e.get("message") or {}).get("type") == "text":
+            out.append((seq, eid, "assistant", e["message"].get("content") or ""))
+    out.sort(key=lambda r: r[0]); return out
+
+
+def _card(title, template, md):
+    return json.dumps({"config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
+        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": md}}]}, ensure_ascii=False)
+
+
+class ChatSync:
+    POLL = 3
+
+    def __init__(self, store, log):
+        self.store, self.log, self.mtimes, self.clients = store, log, {}, {}
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _state_path(self, bid): return os.path.join(data_dir(), f"chatsync_{bid}.json")
+
+    def _loop(self):
+        while True:
+            for bid, b in self.store.bots().items():
+                if not (b.get("sync_enabled") and b.get("agent_id") and b.get("sync_chat_id")
+                        and b.get("app_id") and b.get("app_secret")): continue
+                try: self._tick(bid, b)
+                except Exception as e: self.log(bid, f"聊天同步异常: {type(e).__name__}: {str(e)[:150]}", "warn")
+            time.sleep(self.POLL)
+
+    def _tick(self, bid, b):
+        path = find_transcript(b["agent_id"])
+        if not path: return
+        m = os.path.getmtime(path); key = (bid, b["agent_id"])
+        sp = self._state_path(bid)
+        if self.mtimes.get(key) == m and os.path.exists(sp): return
+        rows = read_transcript(path)
+        if os.path.exists(sp):
+            with open(sp, encoding="utf-8") as f: st = json.load(f)
+        else: st = {}
+        if st.get("agent_id") != b["agent_id"]:  # first run (or agent changed): start at latest, no backlog
+            st = {"agent_id": b["agent_id"], "seq": rows[-1][0] if rows else 0, "sent": []}
+            self._save(sp, st); self.log(bid, f"聊天同步开始，起点 seq={st['seq']}")
+        client = self.clients.get(bid)
+        if not client or client[0] != (b["app_id"], b["app_secret"]):
+            client = ((b["app_id"], b["app_secret"]), lark_client(b["app_id"], b["app_secret"])); self.clients[bid] = client
+        for seq, eid, role, body in rows:
+            if seq <= st["seq"]: continue
+            t = body.strip()
+            if eid not in st["sent"] and t and not t.startswith("飞书"):
+                if role == "user": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
+                else: ok, msg = send_text(b, b["sync_chat_id"], t[:9000], client[1])
+                if not ok: raise RuntimeError(f"发送失败 {msg}")
+                self.log(bid, f"已同步 {role} seq={seq}")
+                st["sent"] = (st["sent"] + [eid])[-500:]
+            st["seq"] = seq; self._save(sp, st)
+        self.mtimes[key] = m
+
+    def _save(self, p, st):
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(st, f, ensure_ascii=False)
+        os.replace(tmp, p)
+
+
 # ---------------- import from /workspace/feishu-bridge ----------------
 def _env(path):
     d = {}
@@ -315,6 +417,16 @@ def _env(path):
         if line.startswith("export "): line = line[7:]
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1); d[k.strip()] = v.strip().strip('"').strip("'")
+    return d
+
+
+def apply_registry_fields(r):
+    """bots_registry.json entry -> sync fields (sync_enabled untouched)."""
+    if not isinstance(r, dict): return {}
+    d = {}
+    if r.get("agent_id"): d["agent_id"] = r["agent_id"]
+    cid = r.get("chat_id") or r.get("FEISHU_P2P_CHAT_ID") or r.get("p2p_chat_id")
+    if cid: d["sync_chat_id"] = cid
     return d
 
 
@@ -331,6 +443,9 @@ def import_legacy(store, base, lark_cfg=os.path.expanduser("~/.lark-cli/config.j
         for a in json.load(open(lark_cfg, encoding="utf-8")).get("apps", []):
             apps[a.get("name") or a.get("appId")] = a.get("appId", "")
     except Exception: pass
+    reg = {}
+    try: reg = json.load(open(os.path.join(base, "bots_registry.json"), encoding="utf-8"))
+    except Exception: pass
     out = []
     bdir = os.path.join(base, "bots")
     for fn in sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []:
@@ -344,7 +459,8 @@ def import_legacy(store, base, lark_cfg=os.path.expanduser("~/.lark-cli/config.j
         b = store.upsert(slug, {"name": name, "app_id": app_id, "webhook_url": url, "webhook_key": key,
             "owner_open_id": c.get("ALLOWED_OPEN_IDS") or c.get("HAOHAO_OPEN_ID", ""),
             "bot_open_id": c.get("BOT_OPEN_ID", ""), "group_all": c.get("GROUP_ALL") == "1",
-            "enabled": exists.get("enabled", False) if exists else False})
+            "enabled": exists.get("enabled", False) if exists else False,
+            **apply_registry_fields(reg.get(slug))})
         b["slug"] = slug; store.save()
         out.append({"id": slug, "name": name, "app_id": bool(app_id), "webhook": bool(url and key),
                     "app_secret": bool(b.get("app_secret"))})

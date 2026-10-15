@@ -19,6 +19,9 @@ class BotIn(BaseModel):
     bot_open_id: str | None = None
     group_all: bool | None = None
     enabled: bool | None = None
+    agent_id: str | None = None
+    sync_chat_id: str | None = None
+    sync_enabled: bool | None = None
 
 
 class ReplyIn(BaseModel):
@@ -76,8 +79,10 @@ def create_app(store: core.Store, mgr: core.Manager):
     def update_bot(bid: str, b: BotIn):
         if not store.get(bid): raise HTTPException(404, "不存在")
         old_enabled = store.get(bid).get("enabled")
-        store.upsert(bid, b.model_dump())
+        d = b.model_dump(); sync_only = all(v is None for k, v in d.items() if k not in ("agent_id", "sync_chat_id", "sync_enabled"))
+        store.upsert(bid, d)
         new = store.get(bid)
+        if sync_only: return view(bid, new)
         if mgr.state(bid) != "stopped":
             mgr.restart(bid)
         elif new.get("enabled") and not old_enabled:
@@ -141,7 +146,11 @@ def create_app(store: core.Store, mgr: core.Manager):
         for bid, b in (body.get("bots") or {}).items():
             exists = store.get(bid)
             b = dict(b); b["enabled"] = exists.get("enabled", False) if exists else False
+            b.update(core.apply_registry_fields((body.get("registry") or {}).get(bid)))
             store.upsert(bid, b); n += 1
+        for bid, r in (body.get("registry") or {}).items():  # registry-only import fills sync fields of existing bots
+            if store.get(bid) and bid not in (body.get("bots") or {}):
+                store.upsert(bid, core.apply_registry_fields(r)); n += 1
         mgr.log("system", f"从配置文件导入 {n} 个机器人（均为未启用状态）")
         return {"imported": n}
 
