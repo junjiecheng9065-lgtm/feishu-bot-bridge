@@ -1,0 +1,29 @@
+{
+  "bots": {
+    "ai-xuexi": {
+      "name": "AI 学习",
+      "app_id": "cli_xxxxxxxxxxxxxxxx",
+      "app_secret": "<在飞书开放平台复制，不要提交到仓库>",
+      "webhook_url": "<Grok Bot 例程面板里的 Webhook URL>",
+      "webhook_key": "<Grok Bot 例程面板里的 Webhook Key>",
+      "owner_open_id": "ou_xxxxxxxxxxxxxxxx",
+      "bot_open_id": "",
+      "group_all": false,
+      "agent_id": "00000000-0000-0000-0000-000000000000",
+      "sync_chat_id": "oc_xxxxxxxxxxxxxxxx",
+      "sync_enabled": true
+    },
+    "tally": {
+      "name": "Tally",
+      "app_id": "cli_yyyyyyyyyyyyyyyy",
+      "app_secret": "<...>",
+      "webhook_url": "<...>",
+      "webhook_key": "<...>",
+      "owner_open_id": "ou_xxxxxxxxxxxxxxxx",
+      "group_all": true,
+      "agent_id": "11111111-1111-1111-1111-111111111111",
+      "sync_chat_id": "oc_yyyyyyyyyyyyyyyy",
+      "sync_enabled": true
+    }
+  }
+}
