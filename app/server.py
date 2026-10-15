@@ -128,33 +128,6 @@ def create_app(store: core.Store, mgr: core.Manager, on_show=None):
         mgr.log(bid, f"测试 webhook → HTTP {st}", "info" if 200 <= st < 300 else "warn")
         return {"status": st, "ok": 200 <= st < 300, "body": body[:200]}
 
-    @app.get("/api/bots/{bid}/avatar")
-    def get_avatar(bid: str):
-        from fastapi.responses import FileResponse, Response
-        b = store.get(bid)
-        if not b: raise HTTPException(404, "不存在")
-        p = core.avatar_path(bid)
-        if not os.path.isfile(p) and b.get("app_id") and b.get("app_secret"):
-            core.fetch_bot_avatar(dict(b, id=bid))
-        if not os.path.isfile(p): return Response(status_code=404)
-        return FileResponse(p, headers={"Cache-Control": "no-cache"})
-
-    @app.post("/api/bots/{bid}/avatar")
-    async def set_avatar(bid: str, request: Request):
-        """Body: JSON {"path": "<local file>"} or raw image bytes (UI upload). Local only; Feishu avatar untouched."""
-        if not store.get(bid): raise HTTPException(404, "不存在")
-        ct = request.headers.get("content-type", "")
-        if ct.startswith("application/json"):
-            src = (await request.json()).get("path") or ""
-            if not os.path.isfile(src): raise HTTPException(400, f"文件不存在: {src}")
-            with open(src, "rb") as f: data = f.read()
-        else:
-            data = await request.body()
-        if not data or len(data) > 10 * 1024 * 1024: raise HTTPException(400, "图片为空或过大")
-        with open(core.avatar_path(bid), "wb") as f: f.write(data)
-        mgr.log(bid, f"头像已更新（本地，{len(data)} 字节）")
-        return {"ok": True, "path": core.avatar_path(bid), "bytes": len(data)}
-
     @app.get("/api/status")
     def status(request: Request):
         bots = store.bots()
