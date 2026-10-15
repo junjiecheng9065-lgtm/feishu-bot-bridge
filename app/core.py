@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.10"
+VERSION = "0.2.11"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -488,6 +488,13 @@ def _widget_options(w):
     return res
 
 
+def _widget_text(body):
+    try:
+        w = json.loads(body)
+        return str(w.get("prompt") or w.get("question") or "请选择") + "\n" + "\n".join(f"{k}. {l}" for k, l, _ in _widget_options(w))
+    except Exception: return ""
+
+
 def widget_card(w, wid, chosen=None):
     """Feishu card for a Grok choice widget. chosen=label -> resolved (no buttons)."""
     prompt = str(w.get("prompt") or w.get("question") or w.get("title") or "请选择")
@@ -595,6 +602,11 @@ class ChatSync:
                         aok, amsg = send_text(b, tg["chat_id"], f"{nm} {ACK_TEXT}", client[1])
                         self.log(bid, f"Tally 派单，已在群里确认" if aok else f"群确认失败 {amsg}", "info" if aok else "warn")
                         dispatched = True
+                if role in ("agent_in", "agent_out"):
+                    ag = self.get_group(bid)
+                    if ag and ag.get("chat_id") and ag["chat_id"] != b.get("sync_chat_id"):
+                        self._mirror_agent(bid, b, role, title, t, client[1])  # group only, no p2p
+                        st["sent"] = (st["sent"] + [eid])[-500:]; st["seq"] = seq; self._save(sp, st); continue
                 g = self.get_group(bid) if role in ("assistant", "widget") else None
                 use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
                 if role == "user":
@@ -625,12 +637,41 @@ class ChatSync:
                     self.log(bid, f"群回复失败 {msg}，改为直接发到群", "warn")
                     ok, msg = send_text(b, g["chat_id"], "", client[1], "interactive", _last_content[0])
                 if not ok: raise RuntimeError(f"发送失败 {msg}")
+                if use_group and role != "user":
+                    self._to_tally(bid, b, g["chat_id"], msg if str(msg).startswith("om_") else "",
+                                   t if role != "widget" else _widget_text(body))
                 where = "群" if use_group and role != "user" else "单聊"
                 self.log(bid, f"已同步到{where} {role} seq={seq}")
-                if role in ("agent_in", "agent_out"): self._mirror_agent(bid, b, role, title, t, client[1])
                 st["sent"] = (st["sent"] + [eid])[-500:]
             st["seq"] = seq; self._save(sp, st)
         self.mtimes[key] = m
+
+    def _to_tally(self, bid, b, chat_id, message_id, text):
+        """Bridge posted a non-Tally bot's message into Tally's GROUP_ALL group -> also POST it to Tally's webhook
+        (Feishu doesn't deliver other bots' messages). Never Tally->Tally; acks are never passed here; deduped."""
+        if b.get("agent_id") == TALLY_AGENT_ID or not chat_id.startswith("oc_") or not text.strip(): return
+        tb = next((x for x in self.store.bots().values() if x.get("agent_id") == TALLY_AGENT_ID), None)
+        if not (tb and tb.get("group_all") and tb.get("webhook_url") and tb.get("webhook_key")): return
+        if tb["id"] == bid: return
+        import hashlib
+        h = message_id or hashlib.sha1((chat_id + "\n" + text[:4000]).encode("utf-8")).hexdigest()
+        dp = os.path.join(data_dir(), "tallyfwd.json"); now = time.time()
+        with self.gmu:
+            try:
+                with open(dp, encoding="utf-8") as f: seen = json.load(f)
+            except (OSError, ValueError): seen = {}
+            seen = {k: v for k, v in seen.items() if now - v < 3600}
+            if h in seen: return
+            seen[h] = now; self._save(dp, seen)
+        p = {"from_bot": True, "bot_name": b.get("name", ""), "bot_slug": b.get("slug") or bid, "text": text[:8000],
+             "chat_id": chat_id, "message_id": message_id, "chat_type": "group", "group_all": True}
+        def go():
+            for attempt in range(4):
+                st, _ = post_webhook(tb["webhook_url"], tb["webhook_key"], p)
+                if 200 <= st < 300: self.log(tb["id"], f"已转发 bot 群消息 来自 {p['bot_name']}"); return
+                time.sleep(min(60, 5 * 2 ** attempt))
+            self.log(tb["id"], f"bot 群消息转发失败 来自 {p['bot_name']}", "warn")
+        threading.Thread(target=go, daemon=True).start()
 
     def _mirror_agent(self, bid, b, role, title, t, client):
         """bot<->bot message -> group card 「from → to」 once (deduped across sender/receiver transcripts)."""
@@ -650,6 +691,7 @@ class ChatSync:
             if h in seen: return
             seen[h] = now; self._save(dp, seen)
         ok, msg = send_text(b, g["chat_id"], "", client, "interactive", _card(hdr, "purple", t[:9000]))
+        if ok and other.lower() != "tally": self._to_tally(bid, b, g["chat_id"], msg if str(msg).startswith("om_") else "", f"[{hdr}] {t}")
         self.log(bid, f"已镜像到群 {hdr}" if ok else f"群镜像失败 {msg}", "info" if ok else "warn")
 
     def _save(self, p, st):
