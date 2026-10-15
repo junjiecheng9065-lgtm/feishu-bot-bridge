@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.12"
+VERSION = "0.2.13"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -117,6 +117,17 @@ def send_text(cfg, target, text, client=None, msg_type="text", content=None):
     if not resp.success():
         return False, f"code={resp.code} msg={resp.msg}"
     return True, getattr(resp.data, "message_id", "") or "ok"
+
+
+def patch_card(cfg, message_id, content, client=None):
+    """Update an interactive card in place (card must have update_multi). Returns (ok, msg)."""
+    from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+    client = client or lark_client(cfg["app_id"], cfg["app_secret"])
+    req = PatchMessageRequest.builder().message_id(message_id).request_body(
+        PatchMessageRequestBody.builder().content(content).build()).build()
+    resp = client.im.v1.message.patch(req)
+    if not resp.success(): return False, f"code={resp.code} msg={resp.msg}"
+    return True, message_id
 
 
 def fetch_bot_open_id(cfg):
@@ -533,7 +544,7 @@ class ChatSync:
             p = self._group_path(bid)
             if v:
                 self._save(p, {"chat_id": v["chat_id"], "message_id": v.get("message_id") or "", "ts": time.time(),
-                               "prefix": v.get("prefix") or ""})
+                               "prefix": v.get("prefix") or "", "dispatched": bool(v.get("dispatched"))})
                 self.log(bid, f"群上下文已记录 {v.get('message_id') or v['chat_id']}")
             elif os.path.exists(p):
                 os.remove(p); self.log(bid, "群上下文已清除")
@@ -598,14 +609,10 @@ class ChatSync:
                     tg = self.get_group(tb["id"]) if tb else None
                     if tg and tg.get("chat_id"):
                         nm = b.get("name") or bid
-                        self.set_group(bid, {"chat_id": tg["chat_id"], "prefix": nm})
-                        fl = self._first_line(t)
-                        if not self._dedupe(tg["chat_id"] + "|派|" + nm + "|" + fl):
-                            pok, pmsg = send_text(b, tg["chat_id"], "", client[1], "interactive",
-                                _card(f"Tally → {nm}：已派", "blue", fl or "…"))
-                            self.log(bid, f"已派到群 {nm}" if pok else f"已派卡片失败 {pmsg}", "info" if pok else "warn")
-                        aok, amsg = send_text(b, tg["chat_id"], f"{nm} {ACK_TEXT}", client[1])
-                        self.log(bid, f"Tally 派单，已在群里确认" if aok else f"群确认失败 {amsg}", "info" if aok else "warn")
+                        self.set_group(bid, {"chat_id": tg["chat_id"], "prefix": nm, "dispatched": True})
+                        if not self._task(tg["chat_id"], nm, "处理中", task=self._first_line(t)):
+                            aok, amsg = send_text(b, tg["chat_id"], f"{nm} {ACK_TEXT}", client[1])  # fallback ack
+                            self.log(bid, f"Tally 派单，已在群里确认" if aok else f"群确认失败 {amsg}", "info" if aok else "warn")
                         dispatched = True
                 if role in ("agent_in", "agent_out"):
                     ag = self.get_group(bid)
@@ -614,6 +621,12 @@ class ChatSync:
                         self._key_agent(bid, b, role, title, t, client[1])
                         st["sent"] = (st["sent"] + [eid])[-500:]; st["seq"] = seq; self._save(sp, st); continue
                     # no group ctx: fall through → p2p 1:1
+                if role == "assistant" and b.get("agent_id") == TALLY_AGENT_ID and t.startswith("已派给"):
+                    tg = self.get_group(bid)
+                    if tg and tg.get("chat_id") and tg["chat_id"] != b.get("sync_chat_id"):
+                        nm, task = self._parse_dispatch(t)
+                        if nm and self._task(tg["chat_id"], nm, "已派", task=task):
+                            st["sent"] = (st["sent"] + [eid])[-500:]; st["seq"] = seq; self._save(sp, st); continue
                 g = self.get_group(bid) if role in ("assistant", "widget") else None
                 use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
                 if role == "user":
@@ -647,6 +660,8 @@ class ChatSync:
                 if use_group and role != "user":
                     self._to_tally(bid, b, g["chat_id"], msg if str(msg).startswith("om_") else "",
                                    t if role != "widget" else _widget_text(body))
+                if use_group and role == "assistant" and g.get("dispatched") and b.get("agent_id") != TALLY_AGENT_ID:
+                    self._task(g["chat_id"], b.get("name") or bid, "完成", result=self._result_line(t))
                 where = "群" if use_group and role != "user" else "单聊"
                 self.log(bid, f"已同步到{where} {role} seq={seq}")
                 st["sent"] = (st["sent"] + [eid])[-500:]
@@ -697,34 +712,95 @@ class ChatSync:
             seen[h] = now; self._save(dp, seen); return False
 
     def _key_agent(self, bid, b, role, title, t, client):
-        """With group ctx: only 已派 (Tally→bot) or 完成/卡住 (bot→Tally). Else stay in Grok."""
+        """With group ctx: bot<->bot only updates the per-dispatch task card. Else stays in Grok."""
         g = self.get_group(bid)
         if not (g and g.get("chat_id") and g["chat_id"] != b.get("sync_chat_id")): return
         me = b.get("name") or bid
         other = title.lstrip("→ ").strip() if role == "agent_out" else title.strip()
-        # (1) 已派: Tally → bot
-        if (role == "agent_out" and b.get("agent_id") == TALLY_AGENT_ID) or (
-                role == "agent_in" and b.get("agent_id") != TALLY_AGENT_ID and title.strip().lower() == "tally"):
-            bot_name = other if role == "agent_out" else me
-            fl = self._first_line(t)
-            if self._dedupe(g["chat_id"] + "|派|" + bot_name + "|" + fl): return
-            hdr = f"Tally → {bot_name}：已派"
-            ok, msg = send_text(b, g["chat_id"], "", client, "interactive", _card(hdr, "blue", fl or "…"))
-            self.log(bid, f"已派到群 {bot_name}" if ok else f"已派卡片失败 {msg}", "info" if ok else "warn")
-            return
-        # (3) bot → Tally with done/blocked markers only (post from bot's agent_out)
-        if role == "agent_out" and other.lower() == "tally":
+        if role == "agent_out" and b.get("agent_id") == TALLY_AGENT_ID and other:  # Tally → bot: 已派
+            self._task(g["chat_id"], other, "已派", task=self._first_line(t)); return
+        if role == "agent_out" and other.lower() == "tally" and b.get("agent_id") != TALLY_AGENT_ID:
             low = t.lower()
-            if not (any(m in t for m in ("完成", "已完成", "卡住", "失败")) or any(m in low for m in ("done", "blocked", "fail"))):
-                return
-            fl = self._first_line(t)
-            if self._dedupe(g["chat_id"] + "|结|" + me + "|" + fl): return
-            hdr = f"{me} → Tally"
-            ok, msg = send_text(b, g["chat_id"], "", client, "interactive", _card(hdr, "purple", fl or "…"))
-            if ok: self._to_tally(bid, b, g["chat_id"], msg if str(msg).startswith("om_") else "", f"[{hdr}] {fl}")
-            self.log(bid, f"已同步到群 {hdr}" if ok else f"群卡片失败 {msg}", "info" if ok else "warn")
-            return
-        # other agent messages with group ctx: Grok only
+            if any(m in t for m in ("卡住", "失败")) or any(m in low for m in ("blocked", "fail")):
+                self._task(g["chat_id"], me, "卡住", result=self._first_line(t, 120))
+            elif any(m in t for m in ("完成", "已完成")) or "done" in low:
+                self._task(g["chat_id"], me, "完成", result=self._result_line(t))
+
+    # ---- task card (one per dispatch, posted as Tally, patched in place) ----
+    _RANK = {"已派": 0, "处理中": 1, "卡住": 2, "完成": 3}
+
+    def _tally(self):
+        tb = next((x for x in self.store.bots().values() if x.get("agent_id") == TALLY_AGENT_ID), None)
+        if not (tb and tb.get("app_id") and tb.get("app_secret")): return None, None
+        c = self.clients.get(tb["id"])
+        if not c or c[0] != (tb["app_id"], tb["app_secret"]):
+            c = ((tb["app_id"], tb["app_secret"]), lark_client(tb["app_id"], tb["app_secret"])); self.clients[tb["id"]] = c
+        return tb, c[1]
+
+    def _parse_dispatch(self, t):
+        line = t.split("\n", 1)[0][len("已派给"):].strip()
+        names = sorted((x.get("name") or "" for x in self.store.bots().values()), key=len, reverse=True)
+        for n in names:
+            if n and line.startswith(n):
+                rest = line[len(n):].lstrip(" ：:，,-—")
+                return n, self._first_line(rest or (t.split("\n", 1)[1] if "\n" in t else ""))
+        m = re.match(r"([^：:，,\s]+)[\s：:，,]*(.*)", line)
+        return (m.group(1), self._first_line(m.group(2))) if m else ("", "")
+
+    def _result_line(self, t):
+        m = re.search(r"https?://\S+", t or "")
+        return m.group(0)[:200] if m else self._first_line(t, 120)
+
+    @staticmethod
+    def _task_card_json(rec):
+        tpl = {"已派": "blue", "处理中": "wathet", "卡住": "red", "完成": "green"}.get(rec["status"], "blue")
+        md = (f"**任务**：{rec.get('task') or '…'}\n**派给**：{rec['bot']}\n**状态**：{rec['status']}\n"
+              f"**时间**：{time.strftime('%m-%d %H:%M', time.gmtime(rec['ts'] + 8 * 3600))} BJT")
+        if rec.get("result"): md += f"\n**{'结果位置' if rec['status'] == '完成' else '说明'}**：{rec['result']}"
+        return json.dumps({"config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {"title": {"tag": "plain_text", "content": f"Tally → {rec['bot']}：{rec['status']}"}, "template": tpl},
+            "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
+
+    def _task(self, chat_id, bot_name, status, task="", result=""):
+        """Create/update the task card for (group, bot). Returns True if a card is in the group."""
+        tb, tc = self._tally()
+        if not tb: return False
+        dp = os.path.join(data_dir(), "tasks.json"); now = time.time(); k = chat_id + "|" + bot_name
+        with self.gmu:
+            try:
+                with open(dp, encoding="utf-8") as f: tasks = json.load(f)
+            except (OSError, ValueError): tasks = {}
+            tasks = {a: v for a, v in tasks.items() if now - v.get("ts", 0) < 86400}
+            rec = tasks.get(k)
+            if rec and (now - rec.get("ts", 0) > self.GROUP_TTL or (rec["status"] == "完成" and status == "已派"
+                        and task and task != rec.get("task"))):
+                rec = None  # stale or a new dispatch after completion -> new card
+            new = rec is None
+            if new: rec = {"bot": bot_name, "task": task, "status": status, "ts": now, "result": result, "mid": ""}
+            else:
+                if self._RANK.get(status, 0) < self._RANK.get(rec["status"], 0) and not (rec["status"] == "卡住" and status == "处理中"):
+                    if not result or result == rec.get("result"): return True  # no downgrade, nothing new
+                    status = rec["status"]
+                if (status, task or rec.get("task"), result or rec.get("result")) == (rec["status"], rec.get("task"), rec.get("result")):
+                    return True  # dedupe
+                rec["status"] = status; rec["task"] = rec.get("task") or task
+                if result: rec["result"] = result
+                rec["ts"] = now
+            tasks[k] = rec; self._save(dp, tasks)
+        content = self._task_card_json(rec); ok = False
+        if rec.get("mid"):
+            ok, msg = patch_card(tb, rec["mid"], content, tc)
+            if not ok: self.log(tb["id"], f"任务卡更新失败 {msg}，改发新卡", "warn")
+        if not ok:
+            ok, msg = send_text(tb, chat_id, "", tc, "interactive", content)
+            if ok and str(msg).startswith("om_"):
+                with self.gmu:
+                    try:
+                        with open(dp, encoding="utf-8") as f: tasks = json.load(f)
+                    except (OSError, ValueError): tasks = {}
+                    if k in tasks: tasks[k]["mid"] = msg; self._save(dp, tasks)
+        self.log(tb["id"], f"任务卡 {bot_name}：{rec['status']}" if ok else f"任务卡发送失败 {msg}", "info" if ok else "warn")
+        return ok
 
     def _save(self, p, st):
         tmp = p + ".tmp"
