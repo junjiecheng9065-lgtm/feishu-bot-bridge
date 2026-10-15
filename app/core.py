@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.18"
+VERSION = "0.2.19"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -737,6 +737,47 @@ class ChatSync:
             self._task(g["chat_id"], target, "卡住", result=self._first_line(t, 120), only_existing=True)
         else:
             self._task(g["chat_id"], target, "完成", result=self._result_line(t), only_existing=True)
+        self._queue_result(g["chat_id"], target, t)
+
+    _TRIVIAL = ("收到", "好的", "ok", "处理中", "马上", "稍等", "在做", "开始")
+
+    def _queue_result(self, chat_id, bot_name, text):
+        """Debounce (20s) the dispatched bot's reply to Tally; post the longest substantive one to the group once."""
+        t = (text or "").strip()
+        if len(t) < 30 and any(w in t.lower() for w in self._TRIVIAL): return
+        if len(t) < 8: return
+        if not hasattr(self, "_rq"): self._rq = {}; self._rqmu = threading.Lock()
+        k = chat_id + "|" + bot_name
+        with self._rqmu:
+            ent = self._rq.get(k)
+            if ent and ent.get("timer"): ent["timer"].cancel()
+            if not ent or len(t) >= len(ent["text"]): ent = {"text": t}
+            ent["timer"] = threading.Timer(20, self._post_result, (chat_id, bot_name, k))
+            ent["timer"].daemon = True; self._rq[k] = ent; ent["timer"].start()
+
+    def _post_result(self, chat_id, bot_name, k):
+        with self._rqmu: ent = self._rq.pop(k, None)
+        if not ent: return
+        t = ent["text"]
+        tgt = next((x for x in self.store.bots().values() if (x.get("name") or x.get("id")) == bot_name), None)
+        if not (tgt and tgt.get("app_id") and tgt.get("app_secret")): return
+        try:
+            with open(os.path.join(data_dir(), "tasks.json"), encoding="utf-8") as f:
+                mid = (json.load(f).get(k) or {}).get("mid", "")
+        except (OSError, ValueError): mid = ""
+        if self._dedupe("res|" + (mid or k) + "|" + t[:200], "resultseen.json", 86400): return
+        parts, rest = [], t
+        while rest:
+            cut = rest[:3800]
+            if len(rest) > 3800 and "\n" in cut[1000:]: cut = cut[:cut.rfind("\n")]
+            parts.append(cut); rest = rest[len(cut):].lstrip("\n")
+        for i, part in enumerate(parts):
+            if len(parts) > 1: part = f"({i + 1}/{len(parts)})\n" + part
+            try: ok, msg = send_text(tgt, mid or chat_id, part)
+            except Exception as e: ok, msg = False, repr(e)[:120]
+            if not ok and mid: ok, msg = send_text(tgt, chat_id, part)
+            self.log(tgt["id"], f"派单结果已发群 {i + 1}/{len(parts)} code=0 mid={msg}" if ok else f"派单结果发群失败 {msg}",
+                     "info" if ok else "warn")
 
     def _target_ack(self, chat_id, bot_name):
         """Dispatched bot itself replies 「收到，处理中…」 (plain text) to Tally's dispatch notice in the group."""
@@ -775,8 +816,6 @@ class ChatSync:
         if len(task) > 60: task = task[:60] + "…"
         tag = {"完成": "✅完成", "卡住": "⚠️卡住"}.get(rec["status"], "处理中")
         out = f"@{rec['bot']} {task}  · {tag}"
-        if rec["status"] == "完成" and rec.get("result"):
-            r = " ".join(rec["result"].split()); out += "\n结果：" + (r[:80] + "…" if len(r) > 80 else r)
         return out
 
     def _task(self, chat_id, bot_name, status, task="", result="", only_existing=False):
