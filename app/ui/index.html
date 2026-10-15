@@ -1,0 +1,73 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>飞书 Bot 桥</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:-apple-system,"Microsoft YaHei","PingFang SC",sans-serif;margin:0;background:#f5f6f7;color:#1f2329}
+header{background:#3370ff;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px}
+header h1{font-size:18px;margin:0;flex:1}
+main{display:grid;grid-template-columns:380px 1fr;gap:16px;padding:16px}
+.card{background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 3px #0001}
+.bot{display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #eee;cursor:pointer}
+.bot.sel{background:#eef3ff}.bot .n{flex:1}.dot{width:10px;height:10px;border-radius:50%;background:#bbb}
+.dot.running{background:#34c724;box-shadow:0 0 6px #34c724}.dot.restarting{background:#ff8800}
+label{display:block;font-size:13px;margin:8px 0 2px;color:#646a73}
+input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #d0d3d6;border-radius:4px}
+button{padding:6px 12px;border:1px solid #d0d3d6;background:#fff;border-radius:4px;cursor:pointer;margin:4px 4px 0 0}
+button.p{background:#3370ff;color:#fff;border-color:#3370ff}button.d{color:#f54a45}
+#logs{height:260px;overflow:auto;font:12px/1.5 Consolas,monospace;background:#1f2329;color:#ddd;padding:8px;border-radius:6px;white-space:pre-wrap}
+.warn{color:#ffb020}.error{color:#ff6b6b}.muted{color:#8f959e;font-size:12px}
+.sw{display:flex;align-items:center;gap:6px;margin-top:8px}
+</style></head><body>
+<header><h1>飞书 Bot 桥 · Feishu ↔ Grok Bot</h1>
+<label class="sw" style="color:#fff;margin:0"><input type="checkbox" id="auto"> 开机自启</label>
+<button onclick="doImport()">一键导入旧配置</button></header>
+<main>
+<div>
+ <div class="card"><b>机器人列表</b> <button class="p" onclick="newBot()" style="float:right">＋ 新增</button>
+  <div id="list" style="margin-top:10px"></div></div>
+ <div class="card muted" style="margin-top:12px" id="info"></div>
+</div>
+<div>
+ <div class="card"><b id="ftitle">新增机器人</b>
+  <form id="f" onsubmit="save(event)">
+   <label>名称</label><input type="text" name="name" required>
+   <label>App ID</label><input type="text" name="app_id" placeholder="cli_xxx">
+   <label>App Secret <span class="muted" id="s1"></span></label><input type="password" name="app_secret" placeholder="留空则保持不变">
+   <label>Webhook URL</label><input type="text" name="webhook_url">
+   <label>Webhook Key <span class="muted" id="s2"></span></label><input type="password" name="webhook_key" placeholder="留空则保持不变">
+   <label>主人 open_id（可选，逗号分隔；为空则不过滤）</label><input type="text" name="owner_open_id">
+   <label>机器人 open_id（可选，留空自动获取）</label><input type="text" name="bot_open_id">
+   <div class="sw"><input type="checkbox" name="group_all" id="ga"><label for="ga" style="margin:0">群聊接收全部消息（GROUP_ALL，不需要 @）</label></div>
+   <div class="sw"><input type="checkbox" name="enabled" id="en"><label for="en" style="margin:0">启用（启动时自动连接）</label></div>
+   <div style="margin-top:10px"><button class="p">保存</button>
+    <span id="acts" style="display:none"><button type="button" onclick="act('start')">启动</button>
+    <button type="button" onclick="act('stop')">停止</button>
+    <button type="button" onclick="testHook()">测试 Webhook</button>
+    <button type="button" class="d" onclick="del()">删除</button></span></div>
+   <div id="msg" class="muted" style="margin-top:6px"></div>
+  </form></div>
+ <div class="card" style="margin-top:12px"><b>日志</b> <span class="muted" id="lf">（全部）</span><div id="logs"></div></div>
+</div></main>
+<script>
+let cur=null, bots=[];
+const $=s=>document.querySelector(s), api=(u,o={})=>fetch(u,{headers:{'Content-Type':'application/json'},...o}).then(async r=>{const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.detail||r.status);return j});
+const stName={running:'运行中',stopped:'已停止',restarting:'重启中'};
+async function load(){bots=await api('/api/bots');$('#list').innerHTML=bots.map(b=>`<div class="bot ${b.id==cur?'sel':''}" onclick="pick('${b.id}')"><span class="dot ${b.state}"></span><span class="n">${esc(b.name)} <span class="muted">${b.id}</span></span><span class="muted">${stName[b.state]}${b.enabled?'':' · 未启用'}</span><input type="checkbox" title="启用" ${b.enabled?'checked':''} onclick="event.stopPropagation();toggle('${b.id}',this.checked)"></div>`).join('')||'<div class="muted">暂无机器人，点击「新增」或「一键导入旧配置」</div>';
+ const s=await api('/api/status');$('#auto').checked=s.autostart;$('#info').textContent=`数据目录：${s.data_dir}　端口：${s.port}　回复接口：POST /reply`;}
+async function logs(){const l=await api('/api/logs?limit=300'+(cur?'&bot='+cur:''));const el=$('#logs'),bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-5;
+ el.innerHTML=l.map(e=>`<span class="${e.level}">${new Date(e.ts*1000).toLocaleString('zh-CN',{hour12:false})} [${e.bot}] ${esc(e.msg)}</span>`).join('\n');if(bottom)el.scrollTop=el.scrollHeight;}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function newBot(){cur=null;$('#f').reset();$('#ftitle').textContent='新增机器人';$('#acts').style.display='none';$('#s1').textContent=$('#s2').textContent='';$('#lf').textContent='（全部）';load();logs()}
+function pick(id){cur=id;const b=bots.find(x=>x.id==id),f=$('#f');for(const k of['name','app_id','webhook_url','owner_open_id','bot_open_id'])f[k].value=b[k]||'';
+ f.app_secret.value=f.webhook_key.value='';f.group_all.checked=b.group_all;f.enabled.checked=b.enabled;$('#s1').textContent=b.app_secret_set?'（已设置）':'（未设置）';$('#s2').textContent=b.webhook_key_set?'（已设置）':'（未设置）';
+ $('#ftitle').textContent='编辑：'+b.name;$('#acts').style.display='inline';$('#lf').textContent='（'+b.name+'）';load();logs()}
+async function save(e){e.preventDefault();const f=$('#f'),d={};for(const k of['name','app_id','app_secret','webhook_url','webhook_key','owner_open_id','bot_open_id'])d[k]=f[k].value.trim();d.group_all=f.group_all.checked;d.enabled=f.enabled.checked;
+ try{const b=await api(cur?'/api/bots/'+cur:'/api/bots',{method:cur?'PUT':'POST',body:JSON.stringify(d)});msg('已保存');await load();pick(b.id)}catch(x){msg('保存失败：'+x.message)}}
+async function act(a){try{await api(`/api/bots/${cur}/${a}`,{method:'POST'});msg(a=='start'?'已启动':'已停止')}catch(x){msg('失败：'+x.message)}load();logs()}
+async function toggle(id,on){await api('/api/bots/'+id,{method:'PUT',body:JSON.stringify({enabled:on})});load()}
+async function testHook(){msg('测试中…');try{const r=await api(`/api/bots/${cur}/test`,{method:'POST'});msg(`Webhook 返回 HTTP ${r.status} ${r.ok?'✅':'❌'}`)}catch(x){msg('失败：'+x.message)}logs()}
+async function del(){if(!confirm('确定删除该机器人？'))return;await api('/api/bots/'+cur,{method:'DELETE'});newBot()}
+async function doImport(){const p=prompt('旧版 feishu-bridge 目录路径','/workspace/feishu-bridge');if(!p)return;try{const r=await api('/api/import',{method:'POST',body:JSON.stringify({path:p})});alert('已导入 '+r.length+' 个机器人（均未启用）。\n缺少 App Secret 的：'+r.filter(x=>!x.app_secret).map(x=>x.name).join('、'));load()}catch(x){alert('导入失败：'+x.message)}}
+$('#auto').onchange=e=>api('/api/autostart',{method:'POST',body:JSON.stringify({enabled:e.target.checked})});
+function msg(t){$('#msg').textContent=t}
+load();logs();setInterval(load,3000);setInterval(logs,2000);
+</script></body></html>

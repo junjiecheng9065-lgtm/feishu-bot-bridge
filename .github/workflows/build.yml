@@ -1,0 +1,44 @@
+name: build
+on: { push: { tags: ["v*"] }, workflow_dispatch: {} }
+jobs:
+  build:
+    strategy:
+      matrix: { os: [windows-latest, macos-latest, ubuntu-22.04] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - name: PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller -y --onefile --noconsole --name FeishuBotBridge --add-data "app/ui;ui" --collect-submodules lark_oapi --hidden-import pystray._win32 run.py
+      - name: NSIS installer
+        if: runner.os == 'Windows'
+        run: |
+          choco install nsis -y
+          & "C:\Program Files (x86)\NSIS\makensis.exe" installer\installer.nsi
+      - name: PyInstaller (macOS .app + dmg)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller -y --windowed --name FeishuBotBridge --add-data "app/ui:ui" --collect-submodules lark_oapi --hidden-import pystray._darwin run.py
+          hdiutil create -volname FeishuBotBridge -srcfolder dist/FeishuBotBridge.app -ov -format UDZO dist/FeishuBotBridge.dmg
+      - name: PyInstaller (Linux AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfuse2
+          pyinstaller -y --onefile --name FeishuBotBridge --add-data "app/ui:ui" --collect-submodules lark_oapi --hidden-import pystray._xorg run.py
+          mkdir -p AppDir/usr/bin && cp dist/FeishuBotBridge AppDir/usr/bin/
+          printf '[Desktop Entry]\nType=Application\nName=FeishuBotBridge\nExec=FeishuBotBridge\nIcon=icon\nCategories=Network;\n' > AppDir/app.desktop
+          python -c "from PIL import Image; Image.new('RGB',(256,256),(51,112,255)).save('AppDir/icon.png')"
+          printf '#!/bin/sh\nexec "$(dirname "$0")/usr/bin/FeishuBotBridge" "$@"\n' > AppDir/AppRun && chmod +x AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool && chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool AppDir dist/FeishuBotBridge-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FeishuBotBridge-${{ runner.os }}
+          path: |
+            dist/FeishuBotBridge-Setup.exe
+            dist/FeishuBotBridge.exe
+            dist/FeishuBotBridge.dmg
+            dist/FeishuBotBridge-x86_64.AppImage

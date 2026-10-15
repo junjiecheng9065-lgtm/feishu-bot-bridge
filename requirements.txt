@@ -1,0 +1,6 @@
+lark-oapi
+fastapi
+uvicorn
+pystray
+pillow
+pyinstaller
