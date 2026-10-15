@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -569,21 +569,38 @@ class ChatSync:
                     st["seq"] = seq; self._save(sp, st); continue
                 t = rest[1].strip()
             if eid not in st["sent"] and t:
-                if role == "user": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
-                elif role == "widget": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive",
-                                                           json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False))
-                elif role == "agent_in": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card(title, "purple", t[:9000]))
-                elif title: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card_t(title, t[:9000]))
-                else: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card(t[:9000]))
+                # Route: p2p stays p2p; group-triggered bot replies go ONLY to that group (not also p2p).
+                # haohao Grok→飞书 user cards always stay on sync_chat_id (p2p).
+                if role == "user" and not body.strip().startswith("飞书"):
+                    self.set_group(bid, None)
+                g = self.get_group(bid) if role in ("assistant", "widget", "agent_in") else None
+                use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
+                if role == "user":
+                    dest = b["sync_chat_id"]
+                elif use_group:
+                    dest = g.get("message_id") or g["chat_id"]
+                else:
+                    dest = b["sync_chat_id"]
+                _last_content = [None]
+                def _st(bb, d, tx, cl, mt, ct, _lc=_last_content):
+                    _lc[0] = ct; return send_text(bb, d, tx, cl, mt, ct)
+                if role == "user":
+                    ok, msg = _st(b, dest, "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
+                elif role == "widget":
+                    ok, msg = _st(b, dest, "", client[1], "interactive",
+                                        json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False))
+                elif role == "agent_in":
+                    ok, msg = _st(b, dest, "", client[1], "interactive", _card(title, "purple", t[:9000]))
+                elif title:
+                    ok, msg = _st(b, dest, "", client[1], "interactive", _md_card_t(title, t[:9000]))
+                else:
+                    ok, msg = _st(b, dest, "", client[1], "interactive", _md_card(t[:9000]))
+                if not ok and use_group and role != "user" and dest.startswith("om_"):
+                    self.log(bid, f"群回复失败 {msg}，改为直接发到群", "warn")
+                    ok, msg = send_text(b, g["chat_id"], "", client[1], "interactive", _last_content[0])
                 if not ok: raise RuntimeError(f"发送失败 {msg}")
-                self.log(bid, f"已同步 {role} seq={seq}")
-                if role == "user" and not body.strip().startswith("飞书"): self.set_group(bid, None)
-                g = self.get_group(bid) if role in ("assistant", "widget") else None
-                if g and g.get("chat_id") != b["sync_chat_id"]:
-                    content = (json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False) if role == "widget"
-                               else _md_card(t[:9000]))
-                    gok, gmsg = send_text(b, g["message_id"], "", client[1], "interactive", content)
-                    self.log(bid, f"已同步到群 {role} seq={seq}" if gok else f"群同步失败 {gmsg}", "info" if gok else "warn")
+                where = "群" if use_group and role != "user" else "单聊"
+                self.log(bid, f"已同步到{where} {role} seq={seq}")
                 st["sent"] = (st["sent"] + [eid])[-500:]
             st["seq"] = seq; self._save(sp, st)
         self.mtimes[key] = m
