@@ -13,10 +13,11 @@ aside{width:212px;flex:none;background:#fff;border-right:1px solid var(--line);d
 .nav a.on .cnt{background:#fff;color:var(--blue)}
 .side-foot{margin-top:auto;font-size:12px;color:var(--t3);padding:10px 8px;border-top:1px solid var(--line)}
 .side-foot .ok{color:var(--green)}
-main{flex:1;display:flex;flex-direction:column;min-width:0}
+main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
 .top{height:64px;flex:none;display:flex;align-items:center;gap:12px;padding:0 28px;background:#fff;border-bottom:1px solid var(--line)}
 .top h2{margin:0;font-size:18px;flex:1}.top .sub{color:var(--t3);font-size:13px;font-weight:400;margin-left:8px}
-.content{flex:1;overflow:auto;padding:24px 28px;display:flex;gap:20px;align-items:flex-start}
+.content{flex:1;min-height:0;overflow:hidden;padding:24px 28px;display:flex;gap:20px;align-items:stretch}
+.content>.empty{align-self:flex-start}
 .btn{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 14px;border:1px solid var(--line);background:#fff;border-radius:6px;cursor:pointer;font:inherit;color:var(--t1);white-space:nowrap}
 .btn:hover{border-color:var(--blue);color:var(--blue)}.btn.p{background:var(--blue);border-color:var(--blue);color:#fff}.btn.p:hover{background:var(--blue-d)}
 .btn.d{color:var(--red)}.btn.d:hover{border-color:var(--red);background:#fef0f0}.btn.sm{height:28px;padding:0 10px;font-size:13px}
@@ -38,9 +39,9 @@ main{flex:1;display:flex;flex-direction:column;min-width:0}
 .sw span{position:absolute;inset:0;background:#d0d3d6;border-radius:10px;transition:.2s;cursor:pointer}
 .sw span:after{content:"";position:absolute;left:2px;top:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.2s;box-shadow:0 1px 2px #0003}
 .sw input:checked+span{background:var(--blue)}.sw input:checked+span:after{left:18px}
-.panel{width:420px;flex:none;background:var(--card);border-radius:var(--r);box-shadow:var(--sh);position:sticky;top:0;max-height:calc(100vh - 112px);display:flex;flex-direction:column}
+.panel{width:420px;flex:none;background:var(--card);border-radius:var(--r);box-shadow:var(--sh);align-self:flex-start;max-height:100%;min-height:0;display:flex;flex-direction:column}
 .panel .ph{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}.panel .ph b{flex:1;font-size:15px}
-.panel form{padding:4px 20px 0;overflow:auto;flex:1}.panel .pf{padding:12px 20px;border-top:1px solid var(--line);display:flex;gap:8px;flex-wrap:wrap}
+.panel form{padding:4px 20px 16px;overflow:auto;flex:1;min-height:0}.panel .ph,.panel .pf{flex:none}.panel .pf{padding:12px 20px;border-top:1px solid var(--line);display:flex;gap:8px;flex-wrap:wrap}
 .sec{font-size:12px;font-weight:600;color:var(--t3);letter-spacing:.5px;margin:18px 0 4px}
 .f{margin-top:10px}.f label{display:block;font-size:13px;color:var(--t2);margin-bottom:4px}.f label em{font-style:normal;font-size:12px;margin-left:6px}
 .f label em.y{color:var(--green)}.f label em.n{color:var(--t3)}
@@ -55,11 +56,11 @@ main{flex:1;display:flex;flex-direction:column;min-width:0}
 .logbar{display:flex;gap:10px;margin-bottom:12px;align-items:center}.logbar .in{width:auto}.logbar .grow{flex:1}
 .seg{display:inline-flex;background:#fff;border:1px solid var(--line);border-radius:6px;padding:2px}.seg button{border:0;background:none;padding:4px 12px;border-radius:4px;cursor:pointer;font:inherit;font-size:13px;color:var(--t2)}
 .seg button.on{background:var(--blue-l);color:var(--blue);font-weight:600}
-.logs{background:var(--card);border-radius:var(--r);box-shadow:var(--sh);overflow:hidden;width:100%}
+.logs{background:var(--card);border-radius:var(--r);box-shadow:var(--sh);overflow:auto;width:100%;flex:1;min-height:0}
 .logs .l{display:grid;grid-template-columns:150px 120px 56px 1fr;gap:12px;padding:7px 16px;border-bottom:1px solid #f0f1f3;font-size:13px;align-items:baseline}
 .logs .l:hover{background:var(--blue-xl)}.logs .l time{color:var(--t3);font:12px Consolas,Menlo,monospace}.logs .l .b{color:var(--blue);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lv{font-size:11px;padding:0 6px;border-radius:3px;text-align:center}.lv.info{background:var(--bg);color:var(--t2)}.lv.warn{background:#fff3e5;color:#d46b00}.lv.error{background:#fde2e2;color:#d83931}
-.logs .m{word-break:break-all}.wide{flex:1;min-width:0}
+.logs .m{word-break:break-all}.wide{flex:1;min-width:0;height:100%;overflow:auto}.wide.col{display:flex;flex-direction:column;overflow:hidden}.wide.col .logbar{flex:none}
 .card{background:var(--card);border-radius:var(--r);box-shadow:var(--sh);padding:6px 20px;margin-bottom:16px;max-width:760px}.card h4{margin:14px 0 4px}
 code{background:var(--bg);padding:1px 6px;border-radius:4px;font-size:12px}
 .mini{display:flex;gap:6px;align-items:center;font-size:13px}
@@ -92,26 +93,46 @@ document.querySelectorAll('.nav a').forEach(a=>a.onclick=()=>go(a.dataset.v));
 function go(v){view=v;document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.v==v));render(true)}
 async function refresh(){try{bots=await api('/api/bots');status=await api('/api/status')}catch(e){return}
  $('#nb').textContent=bots.length;$('#port').textContent=status.port;$('#ver').textContent=status.version||'';
- if(view=='bots'&&!editing)renderBots();if(view=='logs')renderLogs();}
+ if(view=='bots')softBots();else if(view=='logs')renderLogs();}
 function render(full){if(view=='bots'){editing=false;renderBots(true)}else if(view=='logs')renderLogs(true);else renderSettings()}
 function syncTag(b){if(!b.sync_enabled)return '<span class="tag">同步关闭</span>';if(b.sync_error)return '<span class="tag r">同步异常</span>';return '<span class="tag b">聊天同步中</span>'}
-function renderBots(){
- $('#title').innerHTML='机器人<span class="sub">'+bots.filter(b=>b.state=='running').length+' / '+bots.length+' 已连接</span>';
- $('#topacts').innerHTML='<button class="btn" onclick="doImport()">导入旧配置</button> <button class="btn p" onclick="openEdit(null)">＋ 新增机器人</button>';
- const c=$('#content');
- if(!bots.length){c.innerHTML=`<div class="empty">${EMPTY_BOT}<h3>还没有机器人</h3><p>添加一个飞书机器人，把消息转发给 Grok Bot</p><button class="btn p" onclick="openEdit(null)">＋ 新增机器人</button> <button class="btn" onclick="doImport()">导入旧配置</button></div>`;return}
+function botTitle(){$('#title').innerHTML='机器人<span class="sub">'+bots.filter(b=>b.state=='running').length+' / '+bots.length+' 已连接</span>'}
+function leftHtml(){
  const run=bots.filter(b=>b.state=='running').length,syn=bots.filter(b=>b.sync_enabled).length,last=Math.max(0,...bots.map(b=>b.last_msg_at||0));
  const cards=bots.map(b=>`<div class="bot ${b.id==cur?'sel':''}" onclick="openEdit('${b.id}')">
   <div class="h"><div class="av">${esc((b.name||'?').slice(0,1))}</div><div class="nm"><b>${esc(b.name)}</b><small>${esc(b.id)}</small></div>
   <label class="sw" title="启用" onclick="event.stopPropagation()"><input type="checkbox" ${b.enabled?'checked':''} onchange="toggle('${b.id}',this.checked)"><span></span></label></div>
   <div class="tags"><span class="tag ${b.state=='running'?'g':b.state=='restarting'?'o':''}"><span class="dot ${b.state}"></span> ${stName[b.state]}</span>${syncTag(b)}${b.group_all?'<span class="tag">群聊全部</span>':''}${b.enabled?'':'<span class="tag">未启用</span>'}</div>
   <div class="meta"><span>最近消息 ${ago(b.last_msg_at)}</span><span>${b.sync_enabled?'同步 '+ago(b.last_sync_at):(b.restarts?'重启 '+b.restarts+' 次':'')}</span></div></div>`).join('');
- c.innerHTML=`<div class="wide"><div class="stats"><div class="stat"><small>机器人</small><b>${bots.length}</b></div><div class="stat"><small>已连接</small><b style="color:var(--green)">${run}</b></div><div class="stat"><small>聊天同步</small><b style="color:var(--blue)">${syn}</b></div><div class="stat"><small>最近消息</small><b style="font-size:18px;line-height:36px">${ago(last||null)}</b></div></div><div class="grid">${cards}</div></div><div class="panel" id="panel">${panelHtml()}</div>`;
- if(cur!==undefined&&cur!==null||editing)fillForm();}
+ return `<div class="stats"><div class="stat"><small>机器人</small><b>${bots.length}</b></div><div class="stat"><small>已连接</small><b style="color:var(--green)">${run}</b></div><div class="stat"><small>聊天同步</small><b style="color:var(--blue)">${syn}</b></div><div class="stat"><small>最近消息</small><b style="font-size:18px;line-height:36px">${ago(last||null)}</b></div></div><div class="grid">${cards}</div>`}
+// Full rebuild: first load, nav switch, open/close/save/delete. Keeps list scroll; keeps form scroll if the same bot stays open.
+function renderBots(){
+ botTitle();
+ $('#topacts').innerHTML='<button class="btn" onclick="doImport()">导入旧配置</button> <button class="btn p" onclick="openEdit(null)">＋ 新增机器人</button>';
+ const c=$('#content');
+ if(!bots.length&&!editing){c.innerHTML=`<div class="empty">${EMPTY_BOT}<h3>还没有机器人</h3><p>添加一个飞书机器人，把消息转发给 Grok Bot</p><button class="btn p" onclick="openEdit(null)">＋ 新增机器人</button> <button class="btn" onclick="doImport()">导入旧配置</button></div>`;return}
+ const ow=$('#wide'),of=$('#f'),op=$('#panel'),wTop=ow?ow.scrollTop:0,fTop=of&&op&&op.dataset.cur===String(cur??'')?of.scrollTop:0;
+ const h=leftHtml();
+ c.innerHTML=`<div class="wide" id="wide">${h}</div><div class="panel" id="panel" data-cur="${esc(cur??'')}">${panelHtml()}</div>`;
+ const w=$('#wide');w._h=h;w.scrollTop=wTop;
+ if(cur!==undefined&&cur!==null||editing)fillForm();
+ const f=$('#f');if(f&&fTop)f.scrollTop=fTop;}
+// Periodic refresh: update list/stats/status in place; never rebuild the open config form.
+function softBots(){
+ const w=$('#wide');
+ if(!w||(!bots.length&&!editing))return renderBots();
+ const b=cur!=null?bots.find(x=>x.id==cur):null;
+ if(cur!=null&&!b){cur=null;editing=false;return renderBots()}
+ botTitle();
+ const h=leftHtml();if(h!==w._h){const t=w.scrollTop;w.innerHTML=h;w._h=h;w.scrollTop=t}
+ if(b&&$('#f')){const d=$('#panel .ph .dot');if(d)d.className='dot '+b.state;const n=$('#pname');if(n)n.textContent=b.name;
+  const ss=$('#ss');if(ss)ss.textContent=b.state=='stopped'?'启动':'停止';
+  if(!editing)fillForm();}}
+function ssAct(){const b=bots.find(x=>x.id==cur);return b&&b.state=='stopped'?'start':'stop'}
 function panelHtml(){
  if(cur===null&&!editing)return `<div class="empty">${EMPTY_BOT}<h3>选择一个机器人</h3><p>点击左侧卡片查看详情和编辑配置</p></div>`;
  const b=bots.find(x=>x.id==cur);
- return `<div class="ph">${b?`<span class="dot ${b.state}"></span>`:''}<b>${b?esc(b.name):'新增机器人'}</b>${b?`<button class="btn sm" onclick="showLogs('${b.id}')">查看日志</button>`:''}<button class="btn sm" onclick="closeEdit()">✕</button></div>
+ return `<div class="ph">${b?`<span class="dot ${b.state}"></span>`:''}<b id="pname">${b?esc(b.name):'新增机器人'}</b>${b?`<button class="btn sm" onclick="showLogs('${b.id}')">查看日志</button>`:''}<button class="btn sm" onclick="closeEdit()">✕</button></div>
  <form id="f" onsubmit="save(event)" oninput="editing=true">
   <div class="sec">基本信息</div>
   <div class="f"><label>名称</label><input class="in" name="name" required></div>
@@ -130,11 +151,11 @@ function panelHtml(){
   <div class="row"><div>群聊接收全部消息<small>GROUP_ALL，不需要 @</small></div><label class="sw"><input type="checkbox" name="group_all"><span></span></label></div>
   <div class="row"><div>聊天同步<small>读取本机 Grok Bot 聊天记录</small></div><label class="sw"><input type="checkbox" name="sync_enabled"><span></span></label></div>
  </form>
- <div class="pf"><button class="btn p" onclick="save(event)">保存</button>${b?`<button class="btn" onclick="act('${b.state=='stopped'?'start':'stop'}')">${b.state=='stopped'?'启动':'停止'}</button><button class="btn" onclick="testHook()">测试 Webhook</button><span style="flex:1"></span><button class="btn d" onclick="del()">删除</button>`:''}</div>`}
+ <div class="pf"><button class="btn p" onclick="save(event)">保存</button>${b?`<button class="btn" id="ss" onclick="act(ssAct())">${b.state=='stopped'?'启动':'停止'}</button><button class="btn" onclick="testHook()">测试 Webhook</button><span style="flex:1"></span><button class="btn d" onclick="del()">删除</button>`:''}</div>`}
 const TF=['name','app_id','webhook_url','owner_open_id','bot_open_id','agent_id','sync_chat_id'];
 function fillForm(){const f=$('#f');if(!f)return;const b=bots.find(x=>x.id==cur);if(!b){f.enabled.checked=true;return}
  for(const k of TF)f[k].value=b[k]||'';for(const k of['enabled','group_all','sync_enabled'])f[k].checked=!!b[k];
- $('#s1').outerHTML=b.app_secret_set?'<em class="y">● 已设置</em>':'<em class="n">未设置</em>';$('#s2').outerHTML=b.webhook_key_set?'<em class="y">● 已设置</em>':'<em class="n">未设置</em>';}
+ for(const[id,on]of[['s1',b.app_secret_set],['s2',b.webhook_key_set]]){const e=document.getElementById(id);if(e){e.className=on?'y':'n';e.textContent=on?'● 已设置':'未设置'}}}
 function openEdit(id){cur=id;editing=id===null;renderBots();if(id===null)editing=true}
 function closeEdit(){cur=null;editing=false;renderBots()}
 async function save(e){e.preventDefault();const f=$('#f'),d={};for(const k of[...TF,'app_secret','webhook_key'])d[k]=f[k].value.trim();for(const k of['enabled','group_all','sync_enabled'])d[k]=f[k].checked;
@@ -149,14 +170,14 @@ function showLogs(id){lf.bot=id;go('logs')}
 async function renderLogs(first){
  $('#title').innerHTML='运行日志<span class="sub">最近 500 条，自动刷新</span>';$('#topacts').innerHTML='';
  const c=$('#content');
- if(first||!$('#lg')){c.innerHTML=`<div class="wide"><div class="logbar"><select class="in" id="fb" onchange="lf.bot=this.value;drawLogs()"><option value="">全部来源</option><option value="system">系统</option>${bots.map(b=>`<option value="${esc(b.id)}">${esc(b.name)}</option>`).join('')}</select>
+ if(first||!$('#lg')){c.innerHTML=`<div class="wide col"><div class="logbar"><select class="in" id="fb" onchange="lf.bot=this.value;drawLogs()"><option value="">全部来源</option><option value="system">系统</option>${bots.map(b=>`<option value="${esc(b.id)}">${esc(b.name)}</option>`).join('')}</select>
   <div class="seg" id="fl">${[['','全部'],['info','信息'],['warn','警告'],['error','错误']].map(([v,t])=>`<button data-l="${v}" class="${lf.lv==v?'on':''}">${t}</button>`).join('')}</div>
   <input class="in grow" id="fq" placeholder="搜索日志内容…" value="${esc(lf.q)}" oninput="lf.q=this.value;drawLogs()"><button class="btn" onclick="logCache=[];drawLogs()">清空显示</button></div><div class="logs" id="lg"></div></div>`;
   $('#fb').value=lf.bot;document.querySelectorAll('#fl button').forEach(b=>b.onclick=()=>{lf.lv=b.dataset.l;document.querySelectorAll('#fl button').forEach(x=>x.classList.toggle('on',x==b));drawLogs()});}
  try{logCache=await api('/api/logs?limit=500')}catch(e){}drawLogs()}
 function drawLogs(){const name=Object.fromEntries(bots.map(b=>[b.id,b.name]));name.system='系统';const q=lf.q.toLowerCase();
  const l=logCache.filter(e=>(!lf.bot||e.bot==lf.bot)&&(!lf.lv||e.level==lf.lv)&&(!q||(e.msg+e.bot).toLowerCase().includes(q))).slice().reverse();
- $('#lg').innerHTML=l.length?l.map(e=>`<div class="l"><time>${new Date(e.ts*1e3).toLocaleString('zh-CN',{hour12:false})}</time><span class="b">${esc(name[e.bot]||e.bot)}</span><span class="lv ${e.level}">${{info:'信息',warn:'警告',error:'错误'}[e.level]||e.level}</span><span class="m">${esc(e.msg)}</span></div>`).join(''):`<div class="empty" style="box-shadow:none">${EMPTY_LOG}<h3>没有匹配的日志</h3><p>调整筛选条件，或等待新的事件</p></div>`}
+ const lg=$('#lg');if(!lg)return;const st=lg.scrollTop;lg.innerHTML=l.length?l.map(e=>`<div class="l"><time>${new Date(e.ts*1e3).toLocaleString('zh-CN',{hour12:false})}</time><span class="b">${esc(name[e.bot]||e.bot)}</span><span class="lv ${e.level}">${{info:'信息',warn:'警告',error:'错误'}[e.level]||e.level}</span><span class="m">${esc(e.msg)}</span></div>`).join(''):`<div class="empty" style="box-shadow:none">${EMPTY_LOG}<h3>没有匹配的日志</h3><p>调整筛选条件，或等待新的事件</p></div>`;lg.scrollTop=st}
 function renderSettings(){
  $('#title').innerHTML='设置';$('#topacts').innerHTML='';
  $('#content').innerHTML=`<div class="wide"><div class="card"><h4>常规</h4>
