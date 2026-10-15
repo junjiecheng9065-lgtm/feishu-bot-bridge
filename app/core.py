@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -530,7 +530,13 @@ class ChatSync:
         for seq, eid, role, body, title in rows:
             if seq <= st["seq"]: continue
             t = body.strip()
-            if eid not in st["sent"] and t and not t.startswith("飞书"):
+            # Doorway handoff often is "飞书：原文\n回复". Skip echo-only; sync the reply after the first line.
+            if t.startswith("飞书"):
+                rest = t.split("\n", 1)
+                if len(rest) < 2 or not rest[1].strip():
+                    st["seq"] = seq; self._save(sp, st); continue
+                t = rest[1].strip()
+            if eid not in st["sent"] and t:
                 if role == "user": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
                 elif role == "widget": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive",
                                                            json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False))
