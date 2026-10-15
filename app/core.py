@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
