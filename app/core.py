@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.17"
+VERSION = "0.2.18"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -726,7 +726,8 @@ class ChatSync:
         me = b.get("name") or bid
         other = title.lstrip("→ ").strip() if role == "agent_out" else title.strip()
         if role == "agent_out" and b.get("agent_id") == TALLY_AGENT_ID and other:  # Tally → bot: 已派
-            self._task(g["chat_id"], other, "已派", task=self._first_line(t)); return
+            self._task(g["chat_id"], other, "已派", task=self._first_line(t))
+            self._target_ack(g["chat_id"], other); return
         # bot's reply back to Tally: bot-side agent_out, or Tally-side agent_in (same event; card dedupes)
         if role == "agent_out" and other.lower() == "tally" and b.get("agent_id") != TALLY_AGENT_ID: target = me
         elif role == "agent_in" and b.get("agent_id") == TALLY_AGENT_ID and other: target = other
@@ -736,6 +737,22 @@ class ChatSync:
             self._task(g["chat_id"], target, "卡住", result=self._first_line(t, 120), only_existing=True)
         else:
             self._task(g["chat_id"], target, "完成", result=self._result_line(t), only_existing=True)
+
+    def _target_ack(self, chat_id, bot_name):
+        """Dispatched bot itself replies 「收到，处理中…」 (plain text) to Tally's dispatch notice in the group."""
+        tgt = next((x for x in self.store.bots().values() if (x.get("name") or x.get("id")) == bot_name), None)
+        if not (tgt and tgt.get("app_id") and tgt.get("app_secret")):
+            self.log("tally", f"派单回执跳过：找不到 bot {bot_name}", "warn"); return
+        try:
+            with open(os.path.join(data_dir(), "tasks.json"), encoding="utf-8") as f:
+                mid = (json.load(f).get(chat_id + "|" + bot_name) or {}).get("mid", "")
+        except (OSError, ValueError): mid = ""
+        if self._dedupe("ack|" + (mid or chat_id + bot_name + str(int(time.time() // 60))), "ackseen.json", 86400): return
+        try: ok, msg = send_text(tgt, mid or chat_id, ACK_TEXT)
+        except Exception as e: ok, msg = False, repr(e)[:120]
+        if not ok and mid: ok, msg = send_text(tgt, chat_id, ACK_TEXT)
+        self.log(tgt["id"], f"派单回执「{ACK_TEXT}」 code=0 mid={msg} reply_to={mid or '-'}" if ok else f"派单回执失败 {msg}",
+                 "info" if ok else "warn")
 
     # ---- task card (one per dispatch, posted as Tally, patched in place) ----
     _RANK = {"已派": 0, "处理中": 1, "卡住": 2, "完成": 3}
