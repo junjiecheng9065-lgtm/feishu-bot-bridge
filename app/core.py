@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -187,10 +187,42 @@ def worker_main(cfg, other_bot_names, q, seen_path):
             ok, msg = send_text(cfg, mid, ACK_TEXT, client)
             log(f"已回复「{ACK_TEXT}」" if ok else f"回复失败 {msg}", "info" if ok else "warn")
 
+        def on_card(data):
+            from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+            ev = data.event; v = (ev.action.value if ev and ev.action else None) or {}
+            if not isinstance(v, dict) or "fbw" not in v: return P2CardActionTriggerResponse({})
+            sid = ev.operator.open_id if ev.operator else ""
+            if allowed and sid not in allowed:
+                log("忽略非主人卡片点击"); return P2CardActionTriggerResponse({"toast": {"type": "warning", "content": "无权限"}})
+            ctx = ev.context
+            p = {"chat_id": ctx.open_chat_id if ctx else "", "message_id": ctx.open_message_id if ctx else "",
+                 "chat_type": "group" if (ctx and (ctx.open_chat_id or "").startswith("oc_")) else "p2p",
+                 "sender_open_id": sid, "text": v.get("v") or v.get("l") or "", "card_action": True,
+                 "widget_prompt": v.get("p", ""), "bot_slug": cfg.get("slug") or cfg["id"], "bot_name": cfg.get("name", "")}
+            st, body = post_webhook(cfg["webhook_url"], cfg["webhook_key"], p, timeout=2.5)
+            if not 200 <= st < 300:
+                def retry():
+                    for attempt in range(4):
+                        time.sleep(min(60, 5 * 2 ** attempt))
+                        s2, _ = post_webhook(cfg["webhook_url"], cfg["webhook_key"], p)
+                        if 200 <= s2 < 300: log(f"卡片选择已转发(重试) {v.get('l')}"); return
+                    log("卡片选择转发失败", "error")
+                threading.Thread(target=retry, daemon=True).start()
+            else: log(f"卡片选择已转发: {v.get('l')}")
+            w = {"prompt": v.get("p", ""), "options": [{"label": x} for x in (v.get("o") or [v.get("l")])]}
+            try:
+                # rebuild resolved card with all options from current card if possible: only chosen known here
+                card = widget_card(w, v["fbw"], chosen=v.get("l"))
+            except Exception: card = None
+            r = {"toast": {"type": "success", "content": f"已选择：{v.get('l')}"}}
+            if card: r["card"] = {"type": "raw", "data": card}
+            return P2CardActionTriggerResponse(r)
+
         def on_msg(data):
             threading.Thread(target=lambda: _safe(handle, data, log), daemon=True).start()
 
-        eh = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_msg).build()
+        eh = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_msg) \
+            .register_p2_card_action_trigger(on_card).build()
         ws = lark.ws.Client(cfg["app_id"], cfg["app_secret"], event_handler=eh,
                             log_level=lark.LogLevel.INFO, auto_reconnect=True)
         log("websocket 连接中…")
@@ -406,6 +438,9 @@ def read_transcript(path):
             m = e.get("message") or {}
             if m.get("type") == "text" and not e.get("toAgent") and not m.get("toAgent") and not m.get("widget"):
                 out.append((seq, eid, "assistant", m.get("content") or "", ""))
+            elif m.get("type") == "widget" or (m.get("widget") and not e.get("toAgent")):
+                w = m.get("widget") if isinstance(m.get("widget"), dict) else m
+                if w.get("options"): out.append((seq, eid, "widget", json.dumps(w, ensure_ascii=False), ""))
     out.sort(key=lambda r: r[0]); return out
 
 
@@ -425,6 +460,37 @@ def _md_card_t(title, md):
     return json.dumps({"config": {"wide_screen_mode": True, "update_multi": True},
         "header": {"title": {"tag": "plain_text", "content": title}, "template": "grey"},
         "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
+
+
+def _widget_options(w):
+    res = []
+    for i, o in enumerate(w.get("options") or []):
+        if isinstance(o, dict):
+            lab = str(o.get("label") or o.get("value") or ""); val = str(o.get("value") or lab)
+        else: lab = val = str(o)
+        if lab: res.append((chr(65 + i) if i < 26 else str(i + 1), lab, val))
+    return res
+
+
+def widget_card(w, wid, chosen=None):
+    """Feishu card for a Grok choice widget. chosen=label -> resolved (no buttons)."""
+    prompt = str(w.get("prompt") or w.get("question") or w.get("title") or "请选择")
+    opts = _widget_options(w); els = []
+    if chosen is None:
+        btns = [{"tag": "button", "type": "default", "text": {"tag": "plain_text", "content": f"{k}. {lab}"[:100]},
+                 "value": {"fbw": wid, "v": val, "l": lab, "p": prompt[:200], "o": [x[1][:60] for x in opts][:20]}} for k, lab, val in opts]
+        for i in range(0, len(btns), 4): els.append({"tag": "action", "actions": btns[i:i + 4]})
+        tip = "点按钮选择" + ("（多选：可直接在群里回复多个选项）" if w.get("multiSelect") else "")
+        if w.get("allowCustom", True): tip += "；也可直接回复自定义答案"
+        els.append({"tag": "note", "elements": [{"tag": "plain_text", "content": tip}]})
+        tpl = "blue"
+    else:
+        els.append({"tag": "markdown", "content": "\n".join(("✅ **" + lab + "**") if lab == chosen else ("~~" + lab + "~~")
+                                                          for _, lab, _ in opts) or chosen})
+        els.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"已选择：{chosen}"}]})
+        tpl = "green"
+    return {"config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {"title": {"tag": "plain_text", "content": prompt[:100]}, "template": tpl}, "elements": els}
 
 
 class ChatSync:
@@ -466,6 +532,8 @@ class ChatSync:
             t = body.strip()
             if eid not in st["sent"] and t and not t.startswith("飞书"):
                 if role == "user": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
+                elif role == "widget": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive",
+                                                           json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False))
                 elif role == "agent_in": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card(title, "purple", t[:9000]))
                 elif title: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card_t(title, t[:9000]))
                 else: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card(t[:9000]))
