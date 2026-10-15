@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -341,17 +341,45 @@ def find_transcript(agent_id):
     return best and best[1]
 
 
+_HIDDEN_MARKS = ("GROK_BOT_HIDDEN_PROMPT", "<system-reminder", "<background-task", "<task-notification",
+                 "<task_notification", "<automation", "[agent]", "[Agent]")
+_NONUSER_FLAGS = ("fromAgent", "toAgent", "channel", "channelSender", "author", "hidden", "isHidden", "system",
+                  "isSystem", "automationId", "automation", "backgroundTask", "taskId", "source", "origin")
+_BAD_KINDS = ("agent", "system", "automation", "background", "task", "routine", "voice", "hidden", "nudge")
+
+
+def _is_human_user(e):
+    """True only for a message haohao typed himself in the Grok UI."""
+    for k in _NONUSER_FLAGS:
+        if e.get(k): return False
+    meta = e.get("metadata") or e.get("meta") or {}
+    if isinstance(meta, dict):
+        for k in ("kind", "type", "source", "origin", "sender"):
+            v = str(meta.get(k) or "").lower()
+            if any(x in v for x in _BAD_KINDS): return False
+        if meta.get("hidden") or meta.get("fromAgent"): return False
+    nonce = str(e.get("clientNonce") or "")
+    if ":" in nonce: return False  # e.g. voice-nudge:call-... ; typed messages carry a bare uuid/hex nonce
+    c = (e.get("content") or "").lstrip()
+    if any(m in c for m in _HIDDEN_MARKS[:1]) or any(c.startswith(m) for m in _HIDDEN_MARKS[1:]): return False
+    return True
+
+
 def read_transcript(path):
-    """-> [(seq, id, role, body)] ordered by seq. user = message/role user; assistant = send-message text."""
+    """-> [(seq, id, role, body)] ordered by seq.
+    user = message/role user typed by haohao (no fromAgent/channel/author, no hidden/system/automation markers);
+    assistant = only SendToUser text (kind send-message, message.type text), never toAgent replies or widgets."""
     with open(path, encoding="utf-8") as f: j = json.load(f)
     out = []
     for e in (j.get("value") or {}).get("entries") or []:
         k, seq, eid = e.get("kind"), e.get("seq"), e.get("id")
         if seq is None or not eid: continue
-        if k == "message" and e.get("role") in ("user", "assistant") and not e.get("isStreaming"):
-            out.append((seq, eid, e["role"], e.get("content") or ""))
-        elif k == "send-message" and (e.get("message") or {}).get("type") == "text":
-            out.append((seq, eid, "assistant", e["message"].get("content") or ""))
+        if k == "message" and e.get("role") == "user" and not e.get("isStreaming"):
+            if _is_human_user(e): out.append((seq, eid, "user", e.get("content") or ""))
+        elif k == "send-message":
+            m = e.get("message") or {}
+            if m.get("type") == "text" and not e.get("toAgent") and not m.get("toAgent") and not m.get("widget"):
+                out.append((seq, eid, "assistant", m.get("content") or ""))
     out.sort(key=lambda r: r[0]); return out
 
 
@@ -359,6 +387,12 @@ def _card(title, template, md):
     return json.dumps({"config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
         "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": md}}]}, ensure_ascii=False)
+
+
+def _md_card(md):
+    """Headerless card whose markdown element renders links, bold, lists, code."""
+    return json.dumps({"config": {"wide_screen_mode": True, "update_multi": True},
+        "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
 
 
 class ChatSync:
@@ -400,7 +434,7 @@ class ChatSync:
             t = body.strip()
             if eid not in st["sent"] and t and not t.startswith("飞书"):
                 if role == "user": ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _card("haohao", "wathet", t[:9000]))
-                else: ok, msg = send_text(b, b["sync_chat_id"], t[:9000], client[1])
+                else: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card(t[:9000]))
                 if not ok: raise RuntimeError(f"发送失败 {msg}")
                 self.log(bid, f"已同步 {role} seq={seq}")
                 st["sent"] = (st["sent"] + [eid])[-500:]
