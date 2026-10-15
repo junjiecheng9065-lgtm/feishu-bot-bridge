@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.9"
+VERSION = "0.2.10"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -595,7 +595,7 @@ class ChatSync:
                         aok, amsg = send_text(b, tg["chat_id"], f"{nm} {ACK_TEXT}", client[1])
                         self.log(bid, f"Tally 派单，已在群里确认" if aok else f"群确认失败 {amsg}", "info" if aok else "warn")
                         dispatched = True
-                g = self.get_group(bid) if role in ("assistant", "widget", "agent_in") and not dispatched else None
+                g = self.get_group(bid) if role in ("assistant", "widget") else None
                 use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
                 if role == "user":
                     dest = b["sync_chat_id"]
@@ -627,9 +627,30 @@ class ChatSync:
                 if not ok: raise RuntimeError(f"发送失败 {msg}")
                 where = "群" if use_group and role != "user" else "单聊"
                 self.log(bid, f"已同步到{where} {role} seq={seq}")
+                if role in ("agent_in", "agent_out"): self._mirror_agent(bid, b, role, title, t, client[1])
                 st["sent"] = (st["sent"] + [eid])[-500:]
             st["seq"] = seq; self._save(sp, st)
         self.mtimes[key] = m
+
+    def _mirror_agent(self, bid, b, role, title, t, client):
+        """bot<->bot message -> group card 「from → to」 once (deduped across sender/receiver transcripts)."""
+        g = self.get_group(bid)
+        if not (g and g.get("chat_id") and g["chat_id"] != b.get("sync_chat_id")): return
+        me = b.get("name") or bid
+        other = title.lstrip("→ ").strip() if role == "agent_out" else title.strip()
+        hdr = f"{me} → {other or 'Agent'}" if role == "agent_out" else f"{other or 'Agent'} → {me}"
+        import hashlib
+        h = hashlib.sha1((g["chat_id"] + "\n" + t[:4000]).encode("utf-8")).hexdigest()
+        dp = os.path.join(data_dir(), "groupmirror.json"); now = time.time()
+        with self.gmu:
+            try:
+                with open(dp, encoding="utf-8") as f: seen = json.load(f)
+            except (OSError, ValueError): seen = {}
+            seen = {k: v for k, v in seen.items() if now - v < 3600}
+            if h in seen: return
+            seen[h] = now; self._save(dp, seen)
+        ok, msg = send_text(b, g["chat_id"], "", client, "interactive", _card(hdr, "purple", t[:9000]))
+        self.log(bid, f"已镜像到群 {hdr}" if ok else f"群镜像失败 {msg}", "info" if ok else "warn")
 
     def _save(self, p, st):
         tmp = p + ".tmp"
