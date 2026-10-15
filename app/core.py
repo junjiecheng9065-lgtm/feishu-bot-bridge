@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.16"
+VERSION = "0.2.17"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -130,6 +130,17 @@ def patch_card(cfg, message_id, content, client=None):
     return True, message_id
 
 
+def update_text(cfg, message_id, text, client=None):
+    """Edit a text message in place (PUT im/v1/messages/:id). Returns (ok, msg)."""
+    from lark_oapi.api.im.v1 import UpdateMessageRequest, UpdateMessageRequestBody
+    client = client or lark_client(cfg["app_id"], cfg["app_secret"])
+    req = UpdateMessageRequest.builder().message_id(message_id).request_body(
+        UpdateMessageRequestBody.builder().msg_type("text").content(json.dumps({"text": text}, ensure_ascii=False)).build()).build()
+    resp = client.im.v1.message.update(req)
+    if not resp.success(): return False, f"code={resp.code} msg={resp.msg}"
+    return True, message_id
+
+
 def fetch_bot_open_id(cfg):
     import lark_oapi as lark
     client = lark_client(cfg["app_id"], cfg["app_secret"])
@@ -202,7 +213,7 @@ def worker_main(cfg, other_bot_names, q, seen_path):
             q.put({"bot": cfg["id"], "type": "group_ctx",
                    "value": {"chat_id": m.chat_id, "message_id": mid} if m.chat_type == "group" else None})
             ok, msg = send_text(cfg, mid, ACK_TEXT, client)
-            log(f"已回复「{ACK_TEXT}」" if ok else f"回复失败 {msg}", "info" if ok else "warn")
+            log(f"已回复「{ACK_TEXT}」 code=0 mid={msg} reply_to={mid}" if ok else f"回复失败 {msg}", "info" if ok else "warn")
 
         def on_card(data):
             from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
@@ -742,15 +753,14 @@ class ChatSync:
         return m.group(0)[:200] if m else self._first_line(t, 120)
 
     @staticmethod
-    def _task_card_json(rec):
+    def _task_text(rec):
         task = " ".join((rec.get("task") or "…").split())
         if len(task) > 60: task = task[:60] + "…"
-        tag = {"处理中": "处理中", "完成": "✅完成", "卡住": "⚠️卡住"}.get(rec["status"], "")
-        md = f"@{rec['bot']} {task}" + (f"  · {tag}" if tag else "")
+        tag = {"完成": "✅完成", "卡住": "⚠️卡住"}.get(rec["status"], "处理中")
+        out = f"@{rec['bot']} {task}  · {tag}"
         if rec["status"] == "完成" and rec.get("result"):
-            r = " ".join(rec["result"].split()); md += "\n结果：" + (r[:80] + "…" if len(r) > 80 else r)
-        return json.dumps({"config": {"wide_screen_mode": True, "update_multi": True},
-            "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
+            r = " ".join(rec["result"].split()); out += "\n结果：" + (r[:80] + "…" if len(r) > 80 else r)
+        return out
 
     def _task(self, chat_id, bot_name, status, task="", result="", only_existing=False):
         """Create/update the task card for (group, bot). Returns True if a card is in the group."""
@@ -763,8 +773,7 @@ class ChatSync:
             except (OSError, ValueError): tasks = {}
             tasks = {a: v for a, v in tasks.items() if now - v.get("ts", 0) < 86400}
             rec = tasks.get(k)
-            if rec and (now - rec.get("ts", 0) > self.GROUP_TTL or (rec["status"] == "完成" and status == "已派"
-                        and task and task != rec.get("task"))):
+            if rec and (now - rec.get("ts", 0) > self.GROUP_TTL or status == "已派"):
                 rec = None  # stale or a new dispatch after completion -> new card
             new = rec is None
             if new and only_existing: return False  # replies never create a card on their own
@@ -779,19 +788,26 @@ class ChatSync:
                 if result: rec["result"] = result
                 rec["ts"] = now
             tasks[k] = rec; self._save(dp, tasks)
-        content = self._task_card_json(rec); ok = False
+        text = self._task_text(rec); ok = False
         if rec.get("mid"):
-            ok, msg = patch_card(tb, rec["mid"], content, tc)
-            if not ok: self.log(tb["id"], f"任务卡更新失败 {msg}，改发新卡", "warn")
+            if rec.get("shown") == text: return True
+            ok, msg = update_text(tb, rec["mid"], text, tc)
+            if not ok: self.log(tb["id"], f"任务消息编辑失败 {msg}，改发新消息", "warn")
         if not ok:
-            ok, msg = send_text(tb, chat_id, "", tc, "interactive", content)
+            ok, msg = send_text(tb, chat_id, text, tc)
             if ok and str(msg).startswith("om_"):
                 with self.gmu:
                     try:
                         with open(dp, encoding="utf-8") as f: tasks = json.load(f)
                     except (OSError, ValueError): tasks = {}
-                    if k in tasks: tasks[k]["mid"] = msg; self._save(dp, tasks)
-        self.log(tb["id"], f"任务卡 {bot_name}：{rec['status']}" if ok else f"任务卡发送失败 {msg}", "info" if ok else "warn")
+                    if k in tasks: tasks[k]["mid"] = msg; tasks[k]["shown"] = text; self._save(dp, tasks)
+        elif ok:
+            with self.gmu:
+                try:
+                    with open(dp, encoding="utf-8") as f: tasks = json.load(f)
+                except (OSError, ValueError): tasks = {}
+                if k in tasks: tasks[k]["shown"] = text; self._save(dp, tasks)
+        self.log(tb["id"], f"任务消息 {bot_name}：{rec['status']} code=0 mid={msg}" if ok else f"任务消息发送失败 {msg}", "info" if ok else "warn")
         return ok
 
     def _save(self, p, st):
