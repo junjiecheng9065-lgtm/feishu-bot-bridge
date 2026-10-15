@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 ACK_TEXT = "收到，处理中…"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
           "bot_open_id", "group_all", "enabled", "agent_id", "sync_chat_id", "sync_enabled"]
@@ -184,6 +184,8 @@ def worker_main(cfg, other_bot_names, q, seen_path):
             else:
                 log(f"放弃转发 {mid}", "error"); return
             log(f"已转发 {mid} ({m.chat_type})")
+            q.put({"bot": cfg["id"], "type": "group_ctx",
+                   "value": {"chat_id": m.chat_id, "message_id": mid} if m.chat_type == "group" else None})
             ok, msg = send_text(cfg, mid, ACK_TEXT, client)
             log(f"已回复「{ACK_TEXT}」" if ok else f"回复失败 {msg}", "info" if ok else "warn")
 
@@ -209,6 +211,8 @@ def worker_main(cfg, other_bot_names, q, seen_path):
                     log("卡片选择转发失败", "error")
                 threading.Thread(target=retry, daemon=True).start()
             else: log(f"卡片选择已转发: {v.get('l')}")
+            if p["chat_type"] == "group" and p["message_id"]:
+                q.put({"bot": cfg["id"], "type": "group_ctx", "value": {"chat_id": p["chat_id"], "message_id": p["message_id"]}})
             w = {"prompt": v.get("p", ""), "options": [{"label": x} for x in (v.get("o") or [v.get("l")])]}
             try:
                 # rebuild resolved card with all options from current card if possible: only chosen known here
@@ -274,6 +278,8 @@ class Manager:
             except Exception: time.sleep(1); continue
             if e.get("type") == "bot_open_id":
                 if self.store.get(e["bot"]): self.store.upsert(e["bot"], {"bot_open_id": e["value"]})
+            elif e.get("type") == "group_ctx":
+                self.sync.set_group(e["bot"], e.get("value"))
             elif e.get("type") == "state":
                 self.status.setdefault(e["bot"], {})["connected_at"] = time.time()
             else:
@@ -495,10 +501,36 @@ def widget_card(w, wid, chosen=None):
 
 class ChatSync:
     POLL = 3
+    GROUP_TTL = 30 * 60
 
     def __init__(self, store, log):
         self.store, self.log, self.mtimes, self.clients = store, log, {}, {}
+        self.gmu = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    # pending group context: group message woke the bot -> its next replies also go to the group
+    def _group_path(self, bid): return os.path.join(data_dir(), f"groupctx_{bid}.json")
+
+    def set_group(self, bid, v):
+        with self.gmu:
+            p = self._group_path(bid)
+            if v:
+                self._save(p, {"chat_id": v["chat_id"], "message_id": v["message_id"], "ts": time.time()})
+                self.log(bid, f"群上下文已记录 {v['message_id']}")
+            elif os.path.exists(p):
+                os.remove(p); self.log(bid, "群上下文已清除")
+
+    def get_group(self, bid):
+        with self.gmu:
+            p = self._group_path(bid)
+            try:
+                with open(p, encoding="utf-8") as f: g = json.load(f)
+            except (OSError, ValueError): return None
+            if time.time() - g.get("ts", 0) > self.GROUP_TTL:
+                try: os.remove(p)
+                except OSError: pass
+                return None
+            return g
 
     def _state_path(self, bid): return os.path.join(data_dir(), f"chatsync_{bid}.json")
 
@@ -545,6 +577,13 @@ class ChatSync:
                 else: ok, msg = send_text(b, b["sync_chat_id"], "", client[1], "interactive", _md_card(t[:9000]))
                 if not ok: raise RuntimeError(f"发送失败 {msg}")
                 self.log(bid, f"已同步 {role} seq={seq}")
+                if role == "user" and not body.strip().startswith("飞书"): self.set_group(bid, None)
+                g = self.get_group(bid) if role in ("assistant", "widget") else None
+                if g and g.get("chat_id") != b["sync_chat_id"]:
+                    content = (json.dumps(widget_card(json.loads(body), eid), ensure_ascii=False) if role == "widget"
+                               else _md_card(t[:9000]))
+                    gok, gmsg = send_text(b, g["message_id"], "", client[1], "interactive", content)
+                    self.log(bid, f"已同步到群 {role} seq={seq}" if gok else f"群同步失败 {gmsg}", "info" if gok else "warn")
                 st["sent"] = (st["sent"] + [eid])[-500:]
             st["seq"] = seq; self._save(sp, st)
         self.mtimes[key] = m
