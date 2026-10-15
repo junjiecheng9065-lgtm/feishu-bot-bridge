@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.13"
+VERSION = "0.2.14"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -621,12 +621,6 @@ class ChatSync:
                         self._key_agent(bid, b, role, title, t, client[1])
                         st["sent"] = (st["sent"] + [eid])[-500:]; st["seq"] = seq; self._save(sp, st); continue
                     # no group ctx: fall through → p2p 1:1
-                if role == "assistant" and b.get("agent_id") == TALLY_AGENT_ID and t.startswith("已派给"):
-                    tg = self.get_group(bid)
-                    if tg and tg.get("chat_id") and tg["chat_id"] != b.get("sync_chat_id"):
-                        nm, task = self._parse_dispatch(t)
-                        if nm and self._task(tg["chat_id"], nm, "已派", task=task):
-                            st["sent"] = (st["sent"] + [eid])[-500:]; st["seq"] = seq; self._save(sp, st); continue
                 g = self.get_group(bid) if role in ("assistant", "widget") else None
                 use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
                 if role == "user":
@@ -719,12 +713,15 @@ class ChatSync:
         other = title.lstrip("→ ").strip() if role == "agent_out" else title.strip()
         if role == "agent_out" and b.get("agent_id") == TALLY_AGENT_ID and other:  # Tally → bot: 已派
             self._task(g["chat_id"], other, "已派", task=self._first_line(t)); return
-        if role == "agent_out" and other.lower() == "tally" and b.get("agent_id") != TALLY_AGENT_ID:
-            low = t.lower()
-            if any(m in t for m in ("卡住", "失败")) or any(m in low for m in ("blocked", "fail")):
-                self._task(g["chat_id"], me, "卡住", result=self._first_line(t, 120))
-            elif any(m in t for m in ("完成", "已完成")) or "done" in low:
-                self._task(g["chat_id"], me, "完成", result=self._result_line(t))
+        # bot's reply back to Tally: bot-side agent_out, or Tally-side agent_in (same event; card dedupes)
+        if role == "agent_out" and other.lower() == "tally" and b.get("agent_id") != TALLY_AGENT_ID: target = me
+        elif role == "agent_in" and b.get("agent_id") == TALLY_AGENT_ID and other: target = other
+        else: return
+        low = t.lower()
+        if any(m in t for m in ("卡住", "失败")) or any(m in low for m in ("blocked", "fail")):
+            self._task(g["chat_id"], target, "卡住", result=self._first_line(t, 120), only_existing=True)
+        else:
+            self._task(g["chat_id"], target, "完成", result=self._result_line(t), only_existing=True)
 
     # ---- task card (one per dispatch, posted as Tally, patched in place) ----
     _RANK = {"已派": 0, "处理中": 1, "卡住": 2, "完成": 3}
@@ -736,16 +733,6 @@ class ChatSync:
         if not c or c[0] != (tb["app_id"], tb["app_secret"]):
             c = ((tb["app_id"], tb["app_secret"]), lark_client(tb["app_id"], tb["app_secret"])); self.clients[tb["id"]] = c
         return tb, c[1]
-
-    def _parse_dispatch(self, t):
-        line = t.split("\n", 1)[0][len("已派给"):].strip()
-        names = sorted((x.get("name") or "" for x in self.store.bots().values()), key=len, reverse=True)
-        for n in names:
-            if n and line.startswith(n):
-                rest = line[len(n):].lstrip(" ：:，,-—")
-                return n, self._first_line(rest or (t.split("\n", 1)[1] if "\n" in t else ""))
-        m = re.match(r"([^：:，,\s]+)[\s：:，,]*(.*)", line)
-        return (m.group(1), self._first_line(m.group(2))) if m else ("", "")
 
     def _result_line(self, t):
         m = re.search(r"https?://\S+", t or "")
@@ -761,7 +748,7 @@ class ChatSync:
             "header": {"title": {"tag": "plain_text", "content": f"Tally → {rec['bot']}：{rec['status']}"}, "template": tpl},
             "elements": [{"tag": "markdown", "content": md}]}, ensure_ascii=False)
 
-    def _task(self, chat_id, bot_name, status, task="", result=""):
+    def _task(self, chat_id, bot_name, status, task="", result="", only_existing=False):
         """Create/update the task card for (group, bot). Returns True if a card is in the group."""
         tb, tc = self._tally()
         if not tb: return False
@@ -776,6 +763,7 @@ class ChatSync:
                         and task and task != rec.get("task"))):
                 rec = None  # stale or a new dispatch after completion -> new card
             new = rec is None
+            if new and only_existing: return False  # replies never create a card on their own
             if new: rec = {"bot": bot_name, "task": task, "status": status, "ts": now, "result": result, "mid": ""}
             else:
                 if self._RANK.get(status, 0) < self._RANK.get(rec["status"], 0) and not (rec["status"] == "卡住" and status == "处理中"):
