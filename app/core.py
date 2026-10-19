@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.23"
+VERSION = "0.2.24"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -201,6 +201,29 @@ def download_message_image(cfg, message_id, file_key, client=None):
         return True, info
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:100]}"
+
+
+def avatar_path(bid):
+    d = os.path.join(data_dir(), "avatars"); os.makedirs(d, exist_ok=True)
+    return os.path.join(d, re.sub(r"[^A-Za-z0-9_-]", "_", bid) + ".png")
+
+
+def fetch_bot_avatar(cfg):
+    """Read-only: cache the Feishu app's current avatar (bot/v3/info avatar_url). Never changes it. -> path|None"""
+    import lark_oapi as lark
+    p = avatar_path(cfg["id"])
+    if os.path.isfile(p): return p
+    try:
+        client = lark_client(cfg["app_id"], cfg["app_secret"])
+        req = lark.BaseRequest.builder().http_method(lark.HttpMethod.GET).uri("/open-apis/bot/v3/info") \
+            .token_types({lark.AccessTokenType.TENANT}).build()
+        url = json.loads(client.request(req).raw.content).get("bot", {}).get("avatar_url", "")
+        if not url: return None
+        with urllib.request.urlopen(url, timeout=20) as r: data = r.read()
+        with open(p, "wb") as f: f.write(data)
+        return p
+    except Exception:
+        return None
 
 
 # ---------------- worker (child process, one per bot) ----------------
