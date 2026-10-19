@@ -2,7 +2,7 @@
 import json, os, re, sys, time, threading, uuid, collections, multiprocessing as mp, urllib.request
 
 APP_NAME = "FeishuBotBridge"
-VERSION = "0.2.22"
+VERSION = "0.2.23"
 ACK_TEXT = "收到，处理中…"
 DEFAULT_USER_NAME = "桔子"
 FIELDS = ["name", "app_id", "app_secret", "webhook_url", "webhook_key", "owner_open_id",
@@ -555,6 +555,52 @@ def resolve_image(url):
         return None, f"{type(e).__name__}: {str(e)[:100]}"
 
 
+RELAY_FOLDER = "grok-bridge-images"
+_RELAY = {}  # app_id -> {"t": fetched_at, "files": {name: file_token}, "err": str}
+
+
+def _raw(client, method, uri, params=None):
+    import lark_oapi as lark
+    b = lark.BaseRequest.builder().http_method(method).uri(uri).token_types({lark.AccessTokenType.TENANT})
+    if params: b = b.queries([(k, str(v)) for k, v in params.items()])
+    return client.request(b.build())
+
+
+def relay_fetch(cfg, client, name, ttl=8):
+    """Grok images live only on the box. The box-side image_relay.py mirrors them into this app's Drive folder
+    'grok-bridge-images' under the same file name; download by name. -> (bytes|None, how)."""
+    import lark_oapi as lark
+    G = lark.HttpMethod.GET
+    c = _RELAY.setdefault(cfg["app_id"], {"t": 0, "files": {}, "err": ""})
+    try:
+        if name not in c["files"] and time.time() - c["t"] > ttl:
+            c["t"] = time.time()
+            r = json.loads(_raw(client, G, "/open-apis/drive/explorer/v2/root_folder/meta").raw.content)
+            root = (r.get("data") or {}).get("token")
+            if not root: c["err"] = f"root code={r.get('code')}"; return None, "relay: " + c["err"]
+            def ls(tok):
+                out, pt = [], ""
+                while True:
+                    q = {"folder_token": tok, "page_size": 200}
+                    if pt: q["page_token"] = pt
+                    j = json.loads(_raw(client, G, "/open-apis/drive/v1/files", q).raw.content)
+                    if j.get("code"): raise RuntimeError(f"list code={j.get('code')} {str(j.get('msg'))[:80]}")
+                    d = j.get("data") or {}; out += d.get("files") or []
+                    if not d.get("has_more"): return out
+                    pt = d.get("next_page_token") or d.get("page_token") or ""
+            fo = next((f for f in ls(root) if f.get("type") == "folder" and f.get("name") == RELAY_FOLDER), None)
+            if not fo: c["err"] = "folder missing"; return None, "relay: folder missing"
+            c["files"] = {f["name"]: f["token"] for f in ls(fo["token"]) if f.get("type") == "file"}; c["err"] = ""
+        tok = c["files"].get(name)
+        if not tok: return None, "relay: not yet " + (c["err"] or "")
+        r = _raw(client, G, f"/open-apis/drive/v1/files/{tok}/download")
+        if r.code not in (0, None) or not r.raw.content or r.raw.content[:1] == b"{":
+            return None, f"relay: download failed {str(r.raw.content[:120])}"
+        return r.raw.content, "relay"
+    except Exception as e:
+        c["err"] = f"{type(e).__name__}: {str(e)[:100]}"; return None, "relay: " + c["err"]
+
+
 def send_image(cfg, target, data, client=None):
     """Upload bytes via im/v1/images (message) and send msg_type image. Returns (ok, msg)."""
     import io
@@ -588,7 +634,7 @@ def read_transcript(path):
         elif k == "send-message":
             m = e.get("message") or {}
             imgs = _image_urls(m)
-            if imgs and not e.get("toAgent") and not m.get("toAgent"): imgs_map[eid] = (seq, imgs)
+            if imgs and not e.get("toAgent") and not m.get("toAgent"): imgs_map[eid] = (seq, imgs, e.get("timestampMs") or 0)
             if m.get("type") == "text" and not e.get("toAgent") and not m.get("toAgent") and not m.get("widget"):
                 out.append((seq, eid, "assistant", m.get("content") or "", ""))
             elif m.get("type") == "widget" or (m.get("widget") and not e.get("toAgent")):
@@ -660,6 +706,7 @@ class ChatSync:
     def __init__(self, store, log):
         self.store, self.log, self.mtimes, self.clients = store, log, {}, {}
         self.gmu = threading.Lock()
+        self.img_pending, self.img_warned = {}, set()
         threading.Thread(target=self._loop, daemon=True).start()
 
     # pending group context: group message woke the bot -> its next replies also go to the group
@@ -703,7 +750,7 @@ class ChatSync:
         if not path: return
         m = os.path.getmtime(path); key = (bid, b["agent_id"])
         sp = self._state_path(bid)
-        if self.mtimes.get(key) == m and os.path.exists(sp): return
+        if self.mtimes.get(key) == m and os.path.exists(sp) and not self.img_pending.get(bid): return
         rows = read_transcript(path)
         if os.path.exists(sp):
             with open(sp, encoding="utf-8") as f: st = json.load(f)
@@ -792,26 +839,49 @@ class ChatSync:
         self._images(bid, b, rows, st, sp, client, path)
         self.mtimes[key] = m
 
+    IMG_MAX_AGE = 15 * 60  # never send an image whose SendToUser is older than this (no old-image resends)
+
     def _images(self, bid, b, rows, st, sp, client, path):
-        """Send images of SendToUser messages after their text, to the same destination. Deduped via img_sent."""
-        if "img_floor" not in st:
-            st["img_floor"] = (rows[-1][0] - 30) if rows else 0; st["img_sent"] = []  # small backfill on first run
-        for eid, (seq, urls) in sorted(_IMAGES.get(path, {}).items(), key=lambda x: x[1][0]):
+        """Send images of SendToUser messages after their text, to the same destination. Deduped via img_sent.
+        No backfill: on first run (or upgrade from <=0.2.22) the floor is the latest seq; entries older than
+        IMG_MAX_AGE are skipped. Box-only paths are fetched through the Drive relay; retried until IMG_MAX_AGE."""
+        if st.get("img_v") != 2:
+            st["img_floor"] = max(st.get("img_floor", 0), rows[-1][0] if rows else 0)
+            st["img_sent"] = st.get("img_sent", []); st["img_v"] = 2; self._save(sp, st)
+        pending = False; now = time.time() * 1000
+        for eid, (seq, urls, ts) in sorted(_IMAGES.get(path, {}).items(), key=lambda x: x[1][0]):
             if seq <= st["img_floor"] or eid in st["img_sent"]: continue
             if seq > st.get("seq", 0): continue  # wait until text is processed
+            if not ts or now - ts > self.IMG_MAX_AGE * 1000:
+                self.log(bid, f"图片过旧不补发 seq={seq}", "info")
+                st["img_sent"] = (st["img_sent"] + [eid])[-500:]; self._save(sp, st); continue
+            done = st.setdefault("img_done", {}).setdefault(eid, [])
             g = self.get_group(bid)
             use_group = bool(g and g.get("chat_id") and g.get("chat_id") != b.get("sync_chat_id"))
             dest = (g.get("message_id") or g["chat_id"]) if use_group else b["sync_chat_id"]
+            left = False
             for i, u in enumerate(urls):
+                if i in done: continue
                 data, how = resolve_image(u)
                 if data is None:
-                    self.log(bid, f"图片未同步 seq={seq} #{i + 1}: {how}", "warn"); continue
+                    data, how2 = relay_fetch(b, client[1], os.path.basename(u.split("?")[0]))
+                    if data is None:
+                        left = True
+                        k = f"{eid}#{i}"
+                        if k not in self.img_warned:
+                            self.img_warned.add(k); self.log(bid, f"图片等待中继 seq={seq} #{i + 1}: {how}; {how2}", "warn")
+                        continue
+                    how = how2
                 ok, msg = send_image(b, dest, data, client[1])
                 if not ok and use_group and dest.startswith("om_"): ok, msg = send_image(b, g["chat_id"], data, client[1])
                 where = "群" if use_group else "单聊"
                 self.log(bid, f"图片已同步到{where} seq={seq} #{i + 1} ({how}) code=0 mid={msg}" if ok else f"图片发送失败 seq={seq} #{i + 1} {msg}",
                          "info" if ok else "warn")
+                done.append(i)  # sent or hard-failed: never retry/resend
+            if left: pending = True; self._save(sp, st); continue
+            st["img_done"].pop(eid, None)
             st["img_sent"] = (st["img_sent"] + [eid])[-500:]; self._save(sp, st)
+        self.img_pending[bid] = pending
 
     def _to_tally(self, bid, b, chat_id, message_id, text):
         """Bridge posted a non-Tally bot's message into Tally's GROUP_ALL group -> also POST it to Tally's webhook
